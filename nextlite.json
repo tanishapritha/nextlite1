@@ -1,0 +1,8 @@
+{
+  "company":{"name":"Nextlite","description":"A demo business providing customer communication and business workflow automation.","location":"Nagpur, Maharashtra, India"},
+  "business_hours":{"monday_to_friday":"9:00 AM to 6:00 PM","saturday":"10:00 AM to 2:00 PM","sunday":"Closed"},
+  "products":["Nextlite Connect","Nextlite Assist"],
+  "services":["Customer communication automation","AI assistant setup","Business workflow automation"],
+  "refund_policy":"Refunds are handled on a case-by-case basis.",
+  "contact":{"email":"hello@example.com"}
+}

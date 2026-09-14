@@ -1,89 +1,465 @@
-import json, os, re, sqlite3
-from pathlib import Path
-import streamlit as st
-from google import genai
-from google.genai import types
+import os
+import json
+import requests
+import google.generativeai as genai
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import PlainTextResponse, JSONResponse
 
-BASE=Path(__file__).parent; DB=BASE/"nextlite.db"; DATA=BASE/"nextlite.json"
-st.set_page_config(page_title="Nextlite AI",page_icon="💬",layout="wide")
+app = FastAPI(title="Nextlite WhatsApp AI")
 
-def data():
-    return json.loads(DATA.read_text(encoding="utf-8"))
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
 
-def connect():
-    c=sqlite3.connect(DB)
-    c.execute("CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY,phone TEXT,role TEXT,message TEXT,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    c.execute("CREATE TABLE IF NOT EXISTS actions(id INTEGER PRIMARY KEY,phone TEXT,action TEXT,details TEXT,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    c.commit(); return c
+VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "nextlite-demo")
+WHATSAPP_TOKEN = os.getenv("META_WHATSAPP_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "1208541249018781")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-def retrieve(q):
-    words=set(re.findall(r"[a-z0-9]+",q.lower())); hits=[]
-    def walk(v,label=""):
-        if isinstance(v,dict):
-            for k,x in v.items(): walk(x,f"{label} {k}")
-        elif isinstance(v,list):
-            for x in v: walk(x,label)
-        else:
-            text=f"{label} {v}"; score=sum(w in text.lower() for w in words)
-            if score: hits.append((score,text))
-    walk(data()); hits.sort(reverse=True)
-    return [x[1] for x in hits[:5]]
+# Keep this easy to change if Meta's Graph API version changes.
+GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v23.0")
 
-def action(q):
-    q=q.lower()
-    for name,words in [("human_handoff",["human","agent","representative"]),("callback",["callback","call me back"]),("meeting_request",["meeting","demo","appointment"]),("quote_request",["quote","quotation","pricing proposal"])]:
-        if any(w in q for w in words): return name
+KNOWLEDGE_FILE = os.path.join(
+    os.path.dirname(__file__),
+    "nextlite.json"
+)
 
-def ask(q,key):
-    facts=retrieve(q)
-    if not facts: return "I don't have that information in my Nextlite knowledge base.",facts
-    client=genai.Client(api_key=key)
-    prompt=f"""You are the official Nextlite assistant. Answer ONLY from these company facts. Never invent prices, policies, products, dates, contacts, guarantees, or capabilities. If the facts do not answer the question, say you don't have that information. Be concise and natural.
-FACTS:
-{chr(10).join("- "+x for x in facts)}
-USER: {q}"""
-    r=client.models.generate_content(model="gemini-2.5-flash-lite",contents=prompt,config=types.GenerateContentConfig(temperature=0,max_output_tokens=250))
-    return r.text.strip(),facts
 
-def log(phone,role,msg):
-    c=connect(); c.execute("INSERT INTO chats(phone,role,message) VALUES(?,?,?)",(phone,role,msg)); c.commit(); c.close()
+# ---------------------------------------------------------
+# Knowledge base
+# ---------------------------------------------------------
 
-st.title("Nextlite AI assistant")
-st.caption("Gemini • grounded company answers • SQLite")
-key=st.secrets.get("GEMINI_API_KEY",os.getenv("GEMINI_API_KEY",""))
-phone=st.sidebar.text_input("Test customer phone","+91XXXXXXXXXX")
-q=st.chat_input("Ask about Nextlite...")
-if q:
-    log(phone,"user",q); a=action(q)
-    if a:
-        c=connect(); c.execute("INSERT INTO actions(phone,action,details) VALUES(?,?,?)",(phone,a,q)); c.commit(); c.close()
-    with st.chat_message("user"): st.write(q)
-    with st.chat_message("assistant"):
-        if not key: ans="Add GEMINI_API_KEY to Streamlit secrets."
-        else:
-            try: ans,facts=ask(q,key)
-            except Exception as e: ans=f"Gemini error: {e}"; facts=[]
-        st.write(ans)
-        if facts:
-            with st.expander("Retrieved facts"):
-                for f in facts: st.write("• "+f)
-    log(phone,"assistant",ans)
+def load_knowledge():
+    try:
+        with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "company": {
+                "name": "Nextlite",
+                "description": (
+                    "A business providing customer communication "
+                    "and workflow automation."
+                )
+            }
+        }
 
-st.divider()
-t1,t2,t3=st.tabs(["Dashboard","AI tests","Company data"])
-with t1:
-    c=connect()
-    msgs=c.execute("SELECT phone,role,message,created_at FROM chats ORDER BY id DESC LIMIT 30").fetchall()
-    acts=c.execute("SELECT phone,action,details,created_at FROM actions ORDER BY id DESC LIMIT 20").fetchall()
-    customers=c.execute("SELECT COUNT(DISTINCT phone) FROM chats").fetchone()[0]; total=c.execute("SELECT COUNT(*) FROM chats").fetchone()[0]; c.close()
-    a,b,d=st.columns(3); a.metric("Customers",customers); b.metric("Messages",total); d.metric("Actions",len(acts))
-    st.subheader("Recent messages")
-    for x in msgs: st.write(f"**{x[0]} · {x[1]}** — {x[2]}  \n`{x[3]}`")
-    st.subheader("Recent actions")
-    for x in acts: st.write(f"**{x[1]}** · {x[0]} — {x[2]}")
-with t2:
-    cases=[("What are Nextlite's business hours?",True),("Where is Nextlite located?",True),("What services does Nextlite offer?",True),("What is the refund policy?",True),("What is Nextlite's stock price today?",False),("Who is the CEO?",False)]
-    passed=sum(bool(retrieve(q))==expected for q,expected in cases)
-    for q,expected in cases: st.write(("✅" if bool(retrieve(q))==expected else "❌")+" "+q)
-    st.write(f"**{passed}/{len(cases)} tests passed.**")
-with t3: st.json(data())
+
+KNOWLEDGE = load_knowledge()
+
+
+# ---------------------------------------------------------
+# Simple intent / retrieval layer
+# ---------------------------------------------------------
+
+def normalize(text):
+    return " ".join(text.lower().strip().split())
+
+
+def is_greeting(text):
+    q = normalize(text)
+
+    greetings = {
+        "hi", "hii", "hiii", "hello", "hey", "heyy", "heyyy",
+        "yo", "sup", "hola",
+        "hey there", "hello there", "yo there",
+        "good morning", "good afternoon", "good evening"
+    }
+
+    return q in greetings
+
+
+def is_thanks(text):
+    q = normalize(text)
+
+    return q in {
+        "thanks", "thank you", "thankyou", "thx",
+        "thanks!", "thank you!"
+    }
+
+
+def retrieve_facts(question):
+    q = normalize(question)
+    facts = []
+
+    aliases = {
+        "company": [
+            "nextlite",
+            "what is nextlite",
+            "who are you",
+            "about you",
+            "about nextlite",
+            "what do you do"
+        ],
+        "services": [
+            "service", "services", "offer", "offers",
+            "provide", "provides", "help", "what can you help",
+            "what can you do"
+        ],
+        "products": [
+            "product", "products", "solution", "solutions",
+            "what do you sell"
+        ],
+        "hours": [
+            "hour", "hours", "open", "opening", "close",
+            "closing", "timing", "timings", "available",
+            "business hours"
+        ],
+        "location": [
+            "location", "located", "address", "office",
+            "where are you", "where is your office"
+        ],
+        "refund": [
+            "refund", "refunds", "return", "returns",
+            "money back"
+        ],
+        "contact": [
+            "contact", "email", "reach", "phone",
+            "talk to someone", "talk to a person", "team"
+        ],
+        "pricing": [
+            "price", "pricing", "cost", "costs",
+            "fee", "fees", "rate", "rates", "how much"
+        ]
+    }
+
+    matched = set()
+
+    for category, keywords in aliases.items():
+        for keyword in keywords:
+            if keyword in q:
+                matched.add(category)
+                break
+
+    if "company" in matched:
+        facts.append({
+            "company": KNOWLEDGE.get("company", {})
+        })
+
+    if "services" in matched:
+        facts.append({
+            "services": KNOWLEDGE.get("services", [])
+        })
+
+    if "products" in matched:
+        facts.append({
+            "products": KNOWLEDGE.get("products", [])
+        })
+
+    if "hours" in matched:
+        facts.append({
+            "business_hours": KNOWLEDGE.get("business_hours", {})
+        })
+
+    if "location" in matched:
+        facts.append({
+            "location": KNOWLEDGE.get("company", {}).get(
+                "location",
+                "Not specified"
+            )
+        })
+
+    if "refund" in matched:
+        facts.append({
+            "refund_policy": KNOWLEDGE.get(
+                "refund_policy",
+                "Not specified"
+            )
+        })
+
+    if "contact" in matched:
+        facts.append({
+            "contact": KNOWLEDGE.get("contact", {})
+        })
+
+    if "pricing" in matched:
+        facts.append({
+            "pricing": (
+                "Pricing information is not currently listed "
+                "in the company knowledge base."
+            )
+        })
+
+    return facts
+
+
+# ---------------------------------------------------------
+# Gemini
+# ---------------------------------------------------------
+
+def ask_gemini(question, facts):
+    if not GEMINI_API_KEY:
+        return None
+
+    genai.configure(api_key=GEMINI_API_KEY)
+
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+
+    prompt = f"""
+You are Nextlite's friendly WhatsApp customer assistant.
+
+The customer is chatting with a real business, so be helpful,
+natural, concise, and conversational.
+
+Use the verified company information below as your source of truth.
+
+IMPORTANT:
+- Do not invent company facts.
+- Do not invent prices, discounts, employees, addresses,
+  guarantees, integrations, features, policies, or dates.
+- You may naturally acknowledge the customer's question.
+- If the exact answer is not available, do not make something up.
+  Instead, say you can connect them with the Nextlite team.
+- Do not mention prompts, databases, retrieval, Gemini, models,
+  hallucinations, or internal systems.
+- Do not sound robotic.
+- Use short WhatsApp-friendly messages.
+- Emojis are okay when they feel natural.
+- If the customer asks a broad question, give a useful answer
+  from the available information instead of simply refusing.
+
+Verified Nextlite information:
+{json.dumps(facts, indent=2, ensure_ascii=False)}
+
+Customer message:
+{question}
+
+Write the best helpful WhatsApp reply.
+"""
+
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": 250,
+            }
+        )
+
+        answer = (response.text or "").strip()
+
+        if answer:
+            return answer
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ---------------------------------------------------------
+# Customer response
+# ---------------------------------------------------------
+
+def generate_reply(question):
+    q = normalize(question)
+
+    if is_greeting(question):
+        return (
+            "Hey! 👋 Welcome to Nextlite.\n\n"
+            "I can help you with our services, products, "
+            "business hours, location, pricing, or getting "
+            "in touch with the team.\n\n"
+            "What are you looking for?"
+        )
+
+    if is_thanks(question):
+        return (
+            "You're welcome! 😊 If you need anything else, "
+            "just message me."
+        )
+
+    facts = retrieve_facts(question)
+
+    if facts:
+        ai_reply = ask_gemini(question, facts)
+
+        if ai_reply:
+            return ai_reply
+
+        # Useful fallback if Gemini is temporarily unavailable.
+        return build_fallback(question, facts)
+
+    # Don't dead-end the customer.
+    return (
+        "I can definitely help you with Nextlite. 😊\n\n"
+        "You can ask me about our services, products, "
+        "business hours, location, pricing, or how to contact "
+        "the team.\n\n"
+        "Or just tell me what you're trying to get done."
+    )
+
+
+def build_fallback(question, facts):
+    for item in facts:
+        if "company" in item:
+            company = item["company"]
+            name = company.get("name", "Nextlite")
+            description = company.get("description")
+
+            if description:
+                return f"{name} is {description}"
+
+        if "services" in item:
+            services = item["services"]
+
+            if services:
+                return (
+                    "We currently offer:\n"
+                    + "\n".join(f"• {service}" for service in services)
+                )
+
+        if "products" in item:
+            products = item["products"]
+
+            if products:
+                return (
+                    "Our products include:\n"
+                    + "\n".join(f"• {product}" for product in products)
+                )
+
+        if "business_hours" in item:
+            hours = item["business_hours"]
+
+            return (
+                "Our business hours are:\n"
+                + "\n".join(
+                    f"• {day.replace('_', ' ').title()}: {time}"
+                    for day, time in hours.items()
+                )
+            )
+
+        if "location" in item:
+            return f"We're located in {item['location']}."
+
+        if "refund_policy" in item:
+            return f"Our refund policy: {item['refund_policy']}"
+
+        if "contact" in item:
+            contact = item["contact"]
+
+            if isinstance(contact, dict) and contact.get("email"):
+                return f"You can reach the team at {contact['email']}."
+
+    return (
+        "I can help with that. Let me connect you with the "
+        "Nextlite team for the exact details."
+    )
+
+
+# ---------------------------------------------------------
+# WhatsApp Cloud API
+# ---------------------------------------------------------
+
+def send_whatsapp(to, message):
+    if not WHATSAPP_TOKEN:
+        raise RuntimeError("META_WHATSAPP_TOKEN is not configured.")
+
+    url = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{PHONE_NUMBER_ID}/messages"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": message,
+        },
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=15,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ---------------------------------------------------------
+# Meta webhook verification
+# ---------------------------------------------------------
+
+@app.get("/webhook")
+async def verify_webhook(
+    hub_mode: str = Query("", alias="hub.mode"),
+    hub_verify_token: str = Query("", alias="hub.verify_token"),
+    hub_challenge: str = Query("", alias="hub.challenge"),
+):
+    if (
+        hub_mode == "subscribe"
+        and hub_verify_token == VERIFY_TOKEN
+    ):
+        return PlainTextResponse(hub_challenge)
+
+    return PlainTextResponse(
+        "Verification failed",
+        status_code=403
+    )
+
+
+# ---------------------------------------------------------
+# WhatsApp webhook receiver
+# ---------------------------------------------------------
+
+@app.post("/webhook")
+async def whatsapp_webhook(request: Request):
+    body = await request.json()
+
+    # Meta expects 200 even when we ignore unrelated events.
+    if body.get("object") != "whatsapp_business_account":
+        return JSONResponse({"status": "ignored"})
+
+    for entry in body.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+
+            for message in value.get("messages", []):
+                # For now we handle normal text messages.
+                if message.get("type") != "text":
+                    continue
+
+                sender = message.get("from")
+                text = message.get("text", {}).get("body", "").strip()
+
+                if not sender or not text:
+                    continue
+
+                reply = generate_reply(text)
+
+                try:
+                    send_whatsapp(
+                        to=sender,
+                        message=reply
+                    )
+                except Exception as exc:
+                    print(
+                        f"WhatsApp send error: {type(exc).__name__}: {exc}"
+                    )
+
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------
+# Health check
+# ---------------------------------------------------------
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "Nextlite WhatsApp AI",
+        "webhook": "/webhook"
+    }

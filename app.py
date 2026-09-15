@@ -17,7 +17,7 @@ PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "1208541249018781")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # Keep this easy to change if Meta's Graph API version changes.
-GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v23.0")
+GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v26.0")
 
 KNOWLEDGE_FILE = os.path.join(
     os.path.dirname(__file__),

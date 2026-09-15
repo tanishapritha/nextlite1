@@ -4,19 +4,20 @@ import logging
 import sqlite3
 import datetime
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 
 import requests
 import google.generativeai as genai
 
 from fastapi import FastAPI, Request, Query
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 
 
 # ============================================================
 # APP
 # ============================================================
 
-app = FastAPI(title="SmileCare Dental WhatsApp AI")
+app = FastAPI(title="Glaze Dental Clinic WhatsApp AI")
 
 
 # ============================================================
@@ -25,15 +26,9 @@ app = FastAPI(title="SmileCare Dental WhatsApp AI")
 
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "nextlite-demo")
 WHATSAPP_TOKEN = os.getenv("META_WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv(
-    "META_PHONE_NUMBER_ID",
-    "1208541249018781"
-)
+PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "1208541249018781")
+GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v26.0")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GRAPH_API_VERSION = os.getenv(
-    "META_GRAPH_API_VERSION",
-    "v26.0"
-)
 
 DB_PATH = "nextlite.db"
 KNOWLEDGE_PATH = "nextlite.json"
@@ -55,39 +50,127 @@ logger = logging.getLogger("nextlite")
 # GEMINI
 # ============================================================
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
 gemini_model = None
 
 if GEMINI_API_KEY:
     try:
-        gemini_model = genai.GenerativeModel(
-            "gemini-2.5-flash-lite"
-        )
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
         logger.info("Gemini initialized successfully")
     except Exception as exc:
-        logger.error(
-            "Gemini initialization failed | %s: %s",
-            type(exc).__name__,
-            exc
-        )
+        logger.error("Gemini initialization failed | %s: %s", type(exc).__name__, exc)
 
 
 # ============================================================
-# DATABASE
+# KNOWLEDGE BASE
+# ============================================================
+
+DEFAULT_KNOWLEDGE = {
+    "client_id": "glaze-dental",
+    "client_name": "Glaze Dental Clinic",
+    "crm_base_url": "https://dandelion-gigantic-challenge.ngrok-free.dev",
+    "crm_tenant_id": "6b4b6128-5b5f-4d2f-b5de-91511ab9b120",
+    "assistant_name": "Glaze Dental Clinic Assistant",
+    "doctor": {
+        "name": "Dr. Shadab Mulla",
+        "qualification": "B.D.S.",
+        "designation": "Dental Surgeon",
+        "experience": "20 years of experience"
+    },
+    "languages": [
+        "English",
+        "Hindi",
+        "Marathi",
+        "Hinglish"
+    ],
+    "location": {
+        "address": "Shop No 1, Monika 16, Pimpri Colony",
+        "maps": "https://maps.app.goo.gl/H6872MYf2gdthTZ7A?g_st=ac"
+    },
+    "contact": {
+        "phone": "9822977740",
+        "whatsapp": "9822977740"
+    },
+    "services": [
+        {
+            "name": "RCT",
+            "description": "Root canal treatment."
+        },
+        {
+            "name": "Cosmetic dentistry",
+            "description": "Cosmetic dental treatments."
+        },
+        {
+            "name": "Painless extractions",
+            "description": "Specialised in painless treatment."
+        }
+    ],
+    "clinic": {
+        "speciality": "Specialised in painless treatment",
+        "appointment_duration": "30 minutes",
+        "minimum_duration": "30 minutes"
+    },
+    "hours": {
+        "days": [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday"
+        ],
+        "morning": "10:00 AM - 1:00 PM",
+        "evening": "6:00 PM - 9:00 PM"
+    },
+    "emergency": {
+        "enabled": True,
+        "phone": "9822977740",
+        "instruction": "🚨 This may require urgent attention. Please call Glaze Dental Clinic at 9822977740 immediately for emergency assistance."
+    }
+}
+
+
+def load_knowledge() -> Dict[str, Any]:
+    if not os.path.exists(KNOWLEDGE_PATH):
+        logger.warning("nextlite.json not found | using default knowledge")
+        return DEFAULT_KNOWLEDGE
+
+    try:
+        with open(KNOWLEDGE_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        logger.info("Knowledge base loaded from nextlite.json")
+        return data
+    except Exception as exc:
+        logger.error("Knowledge loading failed | %s: %s", type(exc).__name__, exc)
+        return DEFAULT_KNOWLEDGE
+
+
+KNOWLEDGE = load_knowledge()
+
+
+# ============================================================
+# DATABASE & CLIENT CONFIGURATION
 # ============================================================
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
     conn = get_db()
-
     cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS client_config (
+            client_id TEXT PRIMARY KEY,
+            client_name TEXT NOT NULL,
+            crm_base_url TEXT NOT NULL,
+            crm_tenant_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chats (
@@ -99,6 +182,18 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    # Migrate chats table
+    _existing_chats_cols = {
+        row[1] for row in cursor.execute("PRAGMA table_info(chats)")
+    }
+    for _col, _def in [
+        ("direction", "TEXT NOT NULL DEFAULT 'inbound'"),
+        ("message_type", "TEXT"),
+    ]:
+        if _col not in _existing_chats_cols:
+            cursor.execute(f"ALTER TABLE chats ADD COLUMN {_col} {_def}")
+            logger.info("Migrated chats table: added column %s", _col)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS actions (
@@ -112,19 +207,43 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             phone TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL DEFAULT 'glaze-dental',
             state TEXT NOT NULL DEFAULT 'IDLE',
             service TEXT,
+            patient_name TEXT,
+            patient_type TEXT,
             appointment_date TEXT,
             appointment_time TEXT,
             updated_at TEXT NOT NULL
         )
     """)
 
+    # Migrate existing conversations table — add columns that may be missing
+    _existing_conv_cols = {
+        row[1] for row in cursor.execute("PRAGMA table_info(conversations)")
+    }
+    for _col, _def in [
+        ("client_id", "TEXT NOT NULL DEFAULT 'glaze-dental'"),
+        ("state", "TEXT NOT NULL DEFAULT 'IDLE'"),
+        ("service", "TEXT"),
+        ("patient_name", "TEXT"),
+        ("patient_type", "TEXT"),
+        ("appointment_date", "TEXT"),
+        ("appointment_time", "TEXT"),
+    ]:
+        if _col not in _existing_conv_cols:
+            cursor.execute(f"ALTER TABLE conversations ADD COLUMN {_col} {_def}")
+            logger.info("Migrated conversations table: added column %s", _col)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
+            client_id TEXT NOT NULL DEFAULT 'glaze-dental',
+            crm_appointment_id TEXT,
             service TEXT NOT NULL,
+            patient_name TEXT,
+            patient_type TEXT,
             appointment_date TEXT NOT NULL,
             appointment_time TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'confirmed',
@@ -132,10 +251,40 @@ def init_db():
         )
     """)
 
+    # Migrate existing appointments table — add columns that may be missing
+    _existing_appt_cols = {
+        row[1] for row in cursor.execute("PRAGMA table_info(appointments)")
+    }
+    for _col, _def in [
+        ("client_id", "TEXT NOT NULL DEFAULT 'glaze-dental'"),
+        ("crm_appointment_id", "TEXT"),
+        ("patient_name", "TEXT"),
+        ("patient_type", "TEXT"),
+    ]:
+        if _col not in _existing_appt_cols:
+            cursor.execute(f"ALTER TABLE appointments ADD COLUMN {_col} {_def}")
+            logger.info("Migrated appointments table: added column %s", _col)
+
+    # Seed initial Glaze Dental client configuration if not already set
+    seed_client_id = KNOWLEDGE.get("client_id", "glaze-dental")
+    seed_client_name = KNOWLEDGE.get("client_name", "Glaze Dental Clinic")
+    seed_crm_base_url = KNOWLEDGE.get("crm_base_url", "https://dandelion-gigantic-challenge.ngrok-free.dev").rstrip("/")
+    seed_crm_tenant_id = KNOWLEDGE.get("crm_tenant_id", "6b4b6128-5b5f-4d2f-b5de-91511ab9b120").strip()
+
+    cursor.execute("SELECT client_id FROM client_config WHERE client_id = ?", (seed_client_id,))
+    if not cursor.fetchone():
+        cursor.execute("""
+            INSERT INTO client_config (client_id, client_name, crm_base_url, crm_tenant_id, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (seed_client_id, seed_client_name, seed_crm_base_url, seed_crm_tenant_id, datetime.datetime.utcnow().isoformat()))
+        logger.info("Seeded initial CRM configuration for client: %s", seed_client_id)
+
     conn.commit()
     conn.close()
+    logger.info("SQLite initialized successfully")
 
-    logger.info("Database initialized")
+
+init_db()
 
 
 @app.on_event("startup")
@@ -144,217 +293,257 @@ def startup():
 
 
 # ============================================================
-# KNOWLEDGE BASE
+# CLIENT CRM CONFIG HELPERS
 # ============================================================
 
-DEFAULT_KNOWLEDGE = {
-    "clinic_name": "SmileCare Dental Clinic",
-    "description": "A dental clinic providing general and cosmetic dental care.",
-    "services": [
-        {
-            "name": "Dental check-up",
-            "description": "Routine dental examination."
-        },
-        {
-            "name": "Teeth cleaning",
-            "description": "Professional dental cleaning."
-        },
-        {
-            "name": "Teeth whitening",
-            "description": "Professional teeth whitening treatment."
-        },
-        {
-            "name": "Root canal",
-            "description": "Root canal treatment."
-        },
-        {
-            "name": "Dental filling",
-            "description": "Treatment for cavities and damaged teeth."
+def get_client_crm_config(client_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT client_id, client_name, crm_base_url, crm_tenant_id, updated_at FROM client_config WHERE client_id = ?",
+        (client_id,)
+    ).fetchone()
+    conn.close()
+
+    if row:
+        return dict(row)
+
+    # Fallback to seeded Glaze knowledge if matching
+    if client_id == KNOWLEDGE.get("client_id", "glaze-dental"):
+        return {
+            "client_id": client_id,
+            "client_name": KNOWLEDGE.get("client_name", "Glaze Dental Clinic"),
+            "crm_base_url": KNOWLEDGE.get("crm_base_url", "").rstrip("/"),
+            "crm_tenant_id": KNOWLEDGE.get("crm_tenant_id", "").strip(),
+            "updated_at": datetime.datetime.utcnow().isoformat()
         }
-    ],
-    "clinic_info": {
-        "address": "Please contact the clinic for the latest address.",
-        "phone": "Please contact the clinic for the clinic phone number.",
-        "hours": "Please contact the clinic for current opening hours."
+
+    return None
+
+
+def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, crm_tenant_id: str) -> bool:
+    parsed = urlparse(crm_base_url.strip())
+    if not (parsed.scheme in ["http", "https"] and parsed.netloc):
+        raise ValueError("crm_base_url must be a valid HTTP or HTTPS URL.")
+
+    crm_tenant_id = crm_tenant_id.strip()
+    if not crm_tenant_id:
+        raise ValueError("crm_tenant_id cannot be empty.")
+
+    clean_base_url = crm_base_url.strip().rstrip("/")
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO client_config (client_id, client_name, crm_base_url, crm_tenant_id, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(client_id) DO UPDATE SET
+            client_name = excluded.client_name,
+            crm_base_url = excluded.crm_base_url,
+            crm_tenant_id = excluded.crm_tenant_id,
+            updated_at = excluded.updated_at
+    """, (client_id.strip(), client_name.strip(), clean_base_url, crm_tenant_id, datetime.datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def identify_client_for_sender(phone: str) -> str:
+    """
+    Resolves client_id for incoming WhatsApp sender.
+    Defaults to 'glaze-dental' for current practice.
+    """
+    conn = get_db()
+    row = conn.execute("SELECT client_id FROM conversations WHERE phone = ?", (phone,)).fetchone()
+    conn.close()
+    if row and row["client_id"]:
+        return row["client_id"]
+    return "glaze-dental"
+
+
+# ============================================================
+# CRM API INTEGRATION
+# ============================================================
+
+def crm_headers(crm_config: Dict[str, Any], is_post: bool = False) -> Dict[str, str]:
+    headers = {
+        "X-Tenant-Key": crm_config["crm_tenant_id"],
+        "ngrok-skip-browser-warning": "true"
     }
-}
+    if is_post:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
-def load_knowledge() -> Dict[str, Any]:
-    if not os.path.exists(KNOWLEDGE_PATH):
-        logger.warning(
-            "Knowledge file not found | using default knowledge"
-        )
-        return DEFAULT_KNOWLEDGE
+def get_available_slots(client_id: str, date_str: str) -> Optional[List[str]]:
+    crm_config = get_client_crm_config(client_id)
+    if not crm_config:
+        logger.error("CRM SLOTS ERROR | No CRM config found for client=%s", client_id)
+        return None
+
+    base_url = crm_config["crm_base_url"].rstrip("/")
+    url = f"{base_url}/api/v1/integrations/whatsapp/slots"
+    headers = crm_headers(crm_config, is_post=False)
 
     try:
-        with open(
-            KNOWLEDGE_PATH,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
+        logger.info("CRM SLOTS REQUEST | client=%s | date=%s", client_id, date_str)
+        response = requests.get(url, params={"date": date_str}, headers=headers, timeout=15)
+        logger.info("CRM SLOTS | client=%s | date=%s | status=%d", client_id, date_str, response.status_code)
 
-        logger.info("Knowledge base loaded")
-        return data
+        if response.status_code != 200:
+            logger.error("CRM SLOTS ERROR | status=%d | body=%s", response.status_code, response.text[:200])
+            return None
 
+        data = response.json()
+        return data.get("availableSlots", [])
+    except requests.RequestException as exc:
+        logger.error("CRM SLOTS REQUEST ERROR | %s", repr(exc))
+        return None
     except Exception as exc:
-        logger.error(
-            "Knowledge loading failed | %s: %s",
-            type(exc).__name__,
-            exc
+        logger.error("CRM SLOTS ERROR | %s", repr(exc))
+        return None
+
+
+def book_appointment(
+    client_id: str,
+    customer_name: str,
+    customer_phone: str,
+    booking_date: str,
+    booking_time: str,
+    age: str = "",
+    place: str = ""
+) -> Dict[str, Any]:
+    crm_config = get_client_crm_config(client_id)
+    if not crm_config:
+        logger.error("CRM BOOKING ERROR | No CRM config found for client=%s", client_id)
+        return {"status": "error", "data": {}}
+
+    base_url = crm_config["crm_base_url"].rstrip("/")
+    url = f"{base_url}/api/v1/integrations/whatsapp/appointments/book"
+    headers = crm_headers(crm_config, is_post=True)
+
+    payload = {
+        "customerName": customer_name,
+        "customerPhone": customer_phone,
+        "bookingDate": booking_date,
+        "bookingTime": booking_time,
+        "title": "WhatsApp Consultation",
+        "age": age,
+        "place": place
+    }
+
+    try:
+        logger.info("CRM BOOKING REQUEST | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+        logger.info(
+            "CRM BOOKING | client=%s | date=%s | time=%s | status=%d",
+            client_id, booking_date, booking_time, response.status_code
         )
-        return DEFAULT_KNOWLEDGE
 
+        if response.status_code == 201:
+            logger.info("CRM BOOKING SUCCESS | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
+            return {"status": "success", "data": response.json()}
 
-KNOWLEDGE = load_knowledge()
+        if response.status_code == 409:
+            logger.warning("CRM BOOKING CONFLICT | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
+            return {"status": "conflict", "data": response.json()}
+
+        logger.error("CRM BOOKING ERROR | status=%d | body=%s", response.status_code, response.text[:200])
+        return {"status": "error", "data": response.json() if response.text else {}}
+    except requests.RequestException as exc:
+        logger.error("CRM BOOKING REQUEST ERROR | %s", repr(exc))
+        return {"status": "error", "data": {}}
+    except Exception as exc:
+        logger.error("CRM BOOKING ERROR | %s", repr(exc))
+        return {"status": "error", "data": {}}
 
 
 # ============================================================
-# DATABASE HELPERS
+# HELPERS & PERSISTENCE
 # ============================================================
 
-def now_iso():
+def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
 
 
-def log_chat(
-    phone: str,
-    direction: str,
-    message: str,
-    message_type: str = "text"
-):
+def clinic_name() -> str:
+    return KNOWLEDGE.get("client_name", "Glaze Dental Clinic")
+
+
+def log_chat(phone: str, direction: str, message: str, message_type: str = "text"):
     try:
         conn = get_db()
-
         conn.execute(
-            """
-            INSERT INTO chats
-            (phone, direction, message, message_type, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                phone,
-                direction,
-                message,
-                message_type,
-                now_iso()
-            )
+            "INSERT INTO chats (phone, direction, message, message_type, created_at) VALUES (?, ?, ?, ?, ?)",
+            (phone, direction, message, message_type, now_iso())
         )
-
         conn.commit()
         conn.close()
-
     except Exception as exc:
-        logger.error(
-            "Chat logging failed | %s: %s",
-            type(exc).__name__,
-            exc
-        )
+        logger.error("Chat logging failed | %s: %s", type(exc).__name__, exc)
 
 
 def log_action(phone: str, action: str):
     try:
         conn = get_db()
-
-        conn.execute(
-            """
-            INSERT INTO actions
-            (phone, action, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (
-                phone,
-                action,
-                now_iso()
-            )
-        )
-
+        conn.execute("INSERT INTO actions (phone, action, created_at) VALUES (?, ?, ?)", (phone, action, now_iso()))
         conn.commit()
         conn.close()
-
     except Exception as exc:
-        logger.error(
-            "Action logging failed | %s: %s",
-            type(exc).__name__,
-            exc
-        )
+        logger.error("Action logging failed | %s: %s", type(exc).__name__, exc)
 
 
 def get_conversation(phone: str) -> Dict[str, Any]:
     conn = get_db()
-
-    row = conn.execute(
-        """
-        SELECT *
-        FROM conversations
-        WHERE phone = ?
-        """,
-        (phone,)
-    ).fetchone()
-
+    row = conn.execute("SELECT * FROM conversations WHERE phone = ?", (phone,)).fetchone()
     conn.close()
 
     if not row:
         return {
             "phone": phone,
+            "client_id": "glaze-dental",
             "state": "IDLE",
             "service": None,
+            "patient_name": None,
+            "patient_type": None,
             "appointment_date": None,
             "appointment_time": None
         }
-
     return dict(row)
 
 
 def update_conversation(
     phone: str,
+    client_id: Optional[str] = None,
     state: Optional[str] = None,
     service: Optional[str] = None,
+    patient_name: Optional[str] = None,
+    patient_type: Optional[str] = None,
     appointment_date: Optional[str] = None,
     appointment_time: Optional[str] = None
 ):
     current = get_conversation(phone)
-
+    client_id = client_id if client_id is not None else current["client_id"]
     state = state if state is not None else current["state"]
     service = service if service is not None else current["service"]
-    appointment_date = (
-        appointment_date
-        if appointment_date is not None
-        else current["appointment_date"]
-    )
-    appointment_time = (
-        appointment_time
-        if appointment_time is not None
-        else current["appointment_time"]
-    )
+    patient_name = patient_name if patient_name is not None else current["patient_name"]
+    patient_type = patient_type if patient_type is not None else current["patient_type"]
+    appointment_date = appointment_date if appointment_date is not None else current["appointment_date"]
+    appointment_time = appointment_time if appointment_time is not None else current["appointment_time"]
 
     conn = get_db()
-
-    conn.execute(
-        """
+    conn.execute("""
         INSERT INTO conversations
-        (phone, state, service, appointment_date,
-         appointment_time, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(phone)
-        DO UPDATE SET
+        (phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(phone) DO UPDATE SET
+            client_id = excluded.client_id,
             state = excluded.state,
             service = excluded.service,
+            patient_name = excluded.patient_name,
+            patient_type = excluded.patient_type,
             appointment_date = excluded.appointment_date,
             appointment_time = excluded.appointment_time,
             updated_at = excluded.updated_at
-        """,
-        (
-            phone,
-            state,
-            service,
-            appointment_date,
-            appointment_time,
-            now_iso()
-        )
-    )
-
+    """, (phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, now_iso()))
     conn.commit()
     conn.close()
 
@@ -364,190 +553,107 @@ def reset_conversation(phone: str):
         phone=phone,
         state="IDLE",
         service=None,
+        patient_name=None,
+        patient_type=None,
         appointment_date=None,
         appointment_time=None
     )
 
 
-def save_appointment(
+def save_appointment_record(
     phone: str,
+    client_id: str,
     service: str,
+    patient_name: str,
+    patient_type: str,
     appointment_date: str,
-    appointment_time: str
+    appointment_time: str,
+    crm_appointment_id: Optional[str] = None
 ):
     conn = get_db()
-
-    conn.execute(
-        """
+    conn.execute("""
         INSERT INTO appointments
-        (phone, service, appointment_date,
-         appointment_time, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            phone,
-            service,
-            appointment_date,
-            appointment_time,
-            "confirmed",
-            now_iso()
-        )
-    )
-
+        (phone, client_id, crm_appointment_id, service, patient_name, patient_type, appointment_date, appointment_time, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
+    """, (phone, client_id, crm_appointment_id, service, patient_name, patient_type, appointment_date, appointment_time, now_iso()))
     conn.commit()
     conn.close()
 
 
 # ============================================================
-# WHATSAPP API
+# META WHATSAPP CLOUD API
 # ============================================================
 
 def _send_payload(payload: Dict[str, Any]) -> bool:
-
     if not WHATSAPP_TOKEN:
-        logger.error(
-            "WHATSAPP_TOKEN is missing"
-        )
+        logger.error("META_WHATSAPP_TOKEN is missing")
         return False
 
-    url = (
-        f"https://graph.facebook.com/"
-        f"{GRAPH_API_VERSION}/"
-        f"{PHONE_NUMBER_ID}/messages"
-    )
-
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
 
     try:
-
-        logger.info(
-            "WHATSAPP OUTBOUND | URL=%s | PAYLOAD=%s",
-            url,
-            json.dumps(payload, ensure_ascii=False)
-        )
-
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-
-        logger.info(
-            "WHATSAPP RESPONSE | STATUS=%s | BODY=%s",
-            response.status_code,
-            response.text[:2000]
-        )
-
+        logger.info("WHATSAPP OUTBOUND | URL=%s | TO=%s", url, payload.get("to"))
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        logger.info("WHATSAPP RESPONSE | STATUS=%s | BODY=%s", response.status_code, response.text[:500])
         response.raise_for_status()
-
         return True
-
     except requests.exceptions.RequestException as exc:
-
-        logger.error(
-            "WHATSAPP SEND ERROR | %s: %s",
-            type(exc).__name__,
-            exc
-        )
-
+        logger.error("WHATSAPP SEND ERROR | %s: %s", type(exc).__name__, exc)
         return False
 
 
-def send_text_message(
-    phone: str,
-    text: str
-):
-
+def send_text_message(phone: str, text: str) -> bool:
     payload = {
         "messaging_product": "whatsapp",
         "to": phone,
         "type": "text",
-        "text": {
-            "preview_url": False,
-            "body": text
-        }
+        "text": {"preview_url": False, "body": text}
     }
-
     success = _send_payload(payload)
-
     if success:
-        log_chat(
-            phone,
-            "outgoing",
-            text,
-            "text"
-        )
-
+        log_chat(phone, "outgoing", text, "text")
     return success
 
 
-def send_button_message(
-    phone: str,
-    body: str,
-    buttons: List[Dict[str, str]]
-):
-
+def send_button_message(phone: str, body: str, buttons: List[Dict[str, str]]) -> bool:
     buttons = buttons[:3]
-
     payload = {
         "messaging_product": "whatsapp",
         "to": phone,
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {
-                "text": body
-            },
+            "body": {"text": body},
             "action": {
                 "buttons": [
                     {
                         "type": "reply",
-                        "reply": {
-                            "id": button["id"],
-                            "title": button["title"][:20]
-                        }
+                        "reply": {"id": b["id"][:256], "title": b["title"][:20]}
                     }
-                    for button in buttons
+                    for b in buttons
                 ]
             }
         }
     }
-
     success = _send_payload(payload)
-
     if success:
-        log_chat(
-            phone,
-            "outgoing",
-            body,
-            "interactive_button"
-        )
-
+        log_chat(phone, "outgoing", body, "interactive_button")
     return success
 
 
-def send_list_message(
-    phone: str,
-    body: str,
-    button_text: str,
-    rows: List[Dict[str, str]]
-):
-
+def send_list_message(phone: str, body: str, button_text: str, rows: List[Dict[str, str]]) -> bool:
     rows = rows[:10]
-
     payload = {
         "messaging_product": "whatsapp",
         "to": phone,
         "type": "interactive",
         "interactive": {
             "type": "list",
-            "body": {
-                "text": body
-            },
+            "body": {"text": body},
             "action": {
                 "button": button_text[:20],
                 "sections": [
@@ -555,283 +661,155 @@ def send_list_message(
                         "title": "Options",
                         "rows": [
                             {
-                                "id": row["id"],
-                                "title": row["title"][:24],
-                                "description": row.get(
-                                    "description",
-                                    ""
-                                )[:72]
+                                "id": r["id"][:200],
+                                "title": r["title"][:24],
+                                "description": r.get("description", "")[:72]
                             }
-                            for row in rows
+                            for r in rows
                         ]
                     }
                 ]
             }
         }
     }
-
     success = _send_payload(payload)
-
     if success:
-        log_chat(
-            phone,
-            "outgoing",
-            body,
-            "interactive_list"
-        )
-
+        log_chat(phone, "outgoing", body, "interactive_list")
     return success
 
 
 # ============================================================
-# UI
+# UI MENUS
 # ============================================================
 
-def clinic_name():
-    return KNOWLEDGE.get(
-        "clinic_name",
-        "SmileCare Dental Clinic"
-    )
+def main_menu(phone: str) -> bool:
+    body = f"Hi! 👋 Welcome to {clinic_name()}.\n\nHow can we help you today?"
+    buttons = [
+        {"id": "book_appointment", "title": "📅 Book appointment"},
+        {"id": "services", "title": "🦷 Our services"},
+        {"id": "clinic_info", "title": "📍 Clinic info"}
+    ]
+    return send_button_message(phone, body, buttons)
 
 
-def main_menu(phone: str):
-
-    body = (
-        f"Hi! 👋 Welcome to {clinic_name()}.\n\n"
-        "How can we help you today?"
-    )
-
-    return send_button_message(
-        phone,
-        body,
-        [
-            {
-                "id": "book_appointment",
-                "title": "📅 Book appointment"
-            },
-            {
-                "id": "services",
-                "title": "🦷 Our services"
-            },
-            {
-                "id": "clinic_info",
-                "title": "📍 Clinic info"
-            }
-        ]
-    )
-
-
-def send_services(phone: str):
-
-    services = KNOWLEDGE.get(
-        "services",
-        []
-    )
-
-    if not services:
-        return send_text_message(
-            phone,
-            "Please contact the clinic for information about our services."
-        )
-
+def send_services(phone: str) -> bool:
+    services = KNOWLEDGE.get("services", [])
     rows = []
+    for i, s in enumerate(services[:10]):
+        name = s if isinstance(s, str) else s.get("name", f"Service {i+1}")
+        desc = "" if isinstance(s, str) else s.get("description", "")
+        rows.append({"id": f"service_{i}", "title": name[:24], "description": desc[:72]})
 
-    for index, service in enumerate(services[:10]):
-
-        if isinstance(service, str):
-            name = service
-            description = ""
-        else:
-            name = service.get(
-                "name",
-                f"Service {index + 1}"
-            )
-            description = service.get(
-                "description",
-                ""
-            )
-
-        rows.append(
-            {
-                "id": f"service_{index}",
-                "title": name,
-                "description": description
-            }
-        )
-
-    return send_list_message(
-        phone,
-        "Here are our available services:",
-        "View services",
-        rows
-    )
+    return send_list_message(phone, f"Here are the services available at {clinic_name()}:", "View services", rows)
 
 
-def send_clinic_info(phone: str):
-
-    info = KNOWLEDGE.get(
-        "clinic_info",
-        {}
-    )
+def send_clinic_info(phone: str) -> bool:
+    doctor = KNOWLEDGE.get("doctor", {})
+    location = KNOWLEDGE.get("location", {})
+    contact = KNOWLEDGE.get("contact", {})
+    hours = KNOWLEDGE.get("hours", {})
 
     text = (
-        f"📍 {clinic_name()}\n\n"
-        f"Address: {info.get('address', 'Not available')}\n"
-        f"Phone: {info.get('phone', 'Not available')}\n"
-        f"Hours: {info.get('hours', 'Not available')}"
+        f"📍 *{clinic_name()}*\n\n"
+        f"👨‍⚕️ {doctor.get('name', 'Dr. Shadab Mulla')}\n"
+        f"{doctor.get('qualification', 'B.D.S.')} · {doctor.get('designation', 'Dental Surgeon')}\n"
+        f"{doctor.get('experience', '20 years of experience')}\n\n"
+        f"📍 {location.get('address', 'Shop No 1, Monika 16, Pimpri Colony')}\n"
+        f"🗺️ {location.get('maps', '')}\n\n"
+        f"📞 Phone: {contact.get('phone', '9822977740')}\n\n"
+        f"🕒 Monday–Saturday\n"
+        f"• {hours.get('morning', '10:00 AM - 1:00 PM')}\n"
+        f"• {hours.get('evening', '6:00 PM - 9:00 PM')}"
     )
-
-    return send_text_message(
-        phone,
-        text
-    )
+    return send_text_message(phone, text)
 
 
-def send_date_options(phone: str):
+def send_booking_services(phone: str) -> bool:
+    services = KNOWLEDGE.get("services", [])
+    rows = []
+    for i, s in enumerate(services[:10]):
+        name = s if isinstance(s, str) else s.get("name", f"Service {i+1}")
+        desc = "" if isinstance(s, str) else s.get("description", "")
+        rows.append({"id": f"booking_service_{i}", "title": name[:24], "description": desc[:72]})
 
+    return send_list_message(phone, "What treatment would you like to book?", "Choose service", rows)
+
+
+def send_patient_type_options(phone: str) -> bool:
+    buttons = [
+        {"id": "patient_new", "title": "New patient"},
+        {"id": "patient_existing", "title": "Existing patient"}
+    ]
+    return send_button_message(phone, "Are you a new or existing patient?", buttons)
+
+
+def send_date_options(phone: str) -> bool:
     today = datetime.date.today()
     tomorrow = today + datetime.timedelta(days=1)
-
     body = "When would you like your appointment?"
-
-    return send_button_message(
-        phone,
-        body,
-        [
-            {
-                "id": f"date_{today.isoformat()}",
-                "title": "Today"
-            },
-            {
-                "id": f"date_{tomorrow.isoformat()}",
-                "title": "Tomorrow"
-            },
-            {
-                "id": "choose_date",
-                "title": "Choose another date"
-            }
-        ]
-    )
-
-
-def send_time_options(phone: str):
-
-    times = [
-        "10:00 AM",
-        "11:00 AM",
-        "12:00 PM",
-        "02:00 PM",
-        "03:00 PM",
-        "04:00 PM",
-        "05:00 PM"
+    buttons = [
+        {"id": f"date_{today.isoformat()}", "title": "Today"},
+        {"id": f"date_{tomorrow.isoformat()}", "title": "Tomorrow"},
+        {"id": "choose_date", "title": "Choose another date"}
     ]
+    return send_button_message(phone, body, buttons)
 
-    rows = [
-        {
-            "id": f"time_{time}",
-            "title": time
-        }
-        for time in times
-    ]
-
-    return send_list_message(
-        phone,
-        "Choose an available time:",
-        "View times",
-        rows
-    )
-
-
-# ============================================================
-# DATE PARSING
-# ============================================================
 
 def parse_date_input(text: str) -> Optional[str]:
-
     text = text.strip().lower()
-
     today = datetime.date.today()
-    tomorrow = today + datetime.timedelta(days=1)
 
-    if text in {
-        "today",
-        "tod",
-        "aaj"
-    }:
+    if text in {"today", "tod", "aaj"}:
         return today.isoformat()
+    if text in {"tomorrow", "tmrw", "tmr", "kal"}:
+        return (today + datetime.timedelta(days=1)).isoformat()
 
-    if text in {
-        "tomorrow",
-        "tmrw",
-        "tmr",
-        "kal"
-    }:
-        return tomorrow.isoformat()
-
-    formats = [
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-        "%d/%m/%y",
-        "%d-%m-%y"
-    ]
-
+    formats = ["%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%y"]
     for fmt in formats:
         try:
-            parsed = datetime.datetime.strptime(
-                text,
-                fmt
-            ).date()
-
+            parsed = datetime.datetime.strptime(text, fmt).date()
             if parsed < today:
                 return None
-
             return parsed.isoformat()
-
         except ValueError:
             continue
 
     return None
 
 
+def is_emergency(text: str) -> bool:
+    text_lower = text.lower()
+    emergency_keywords = ["accident", "extreme pain", "severe pain", "allergy", "emergency", "urgent", "bleeding badly"]
+    return any(w in text_lower for w in emergency_keywords)
+
+
+def is_pricing_question(text: str) -> bool:
+    text_lower = text.lower()
+    pricing_keywords = ["price", "cost", "fee", "fees", "charge", "charges", "how much", "rate", "rates", "pricing"]
+    return any(w in text_lower for w in pricing_keywords)
+
+
 # ============================================================
-# GEMINI
+# GEMINI FREE TEXT FALLBACK
 # ============================================================
 
-def ask_gemini(
-    question: str
-) -> Optional[str]:
-
+def ask_gemini(question: str) -> Optional[str]:
     if not gemini_model:
         return None
 
-    knowledge_text = json.dumps(
-        KNOWLEDGE,
-        ensure_ascii=False,
-        indent=2
-    )
+    knowledge_text = json.dumps(KNOWLEDGE, ensure_ascii=False, indent=2)
 
     prompt = f"""
 You are the customer support assistant for {clinic_name()}.
 
-Answer the customer's question using ONLY the verified
-information in the knowledge base below.
+Answer the customer's question using ONLY the verified information in the knowledge base below.
 
-Do not invent:
-- prices
-- doctors
-- timings
-- addresses
-- phone numbers
-- medical claims
-- availability
-- policies
-
-If the answer is not available in the knowledge base,
-say that you do not have that information and suggest
-contacting the clinic.
-
-Keep the answer short and natural for WhatsApp.
+CRITICAL RULES:
+- Do not invent prices, consultation fees, discounts, or treatment costs.
+- Do not invent doctors, branches, insurance, or medical guarantees.
+- If asked about prices or fees, clearly state that pricing details are not listed and recommend calling {clinic_name()} at 9822977740.
+- If the answer is not available in the knowledge base, politely explain that you do not have that information and suggest contacting the clinic.
+- Keep the answer short (1-3 sentences), reassuring, and natural for WhatsApp.
 
 Knowledge base:
 {knowledge_text}
@@ -839,1086 +817,616 @@ Knowledge base:
 Customer question:
 {question}
 """
-
     try:
-
         response = gemini_model.generate_content(
             prompt,
-            generation_config={
-                "temperature": 0.2,
-                "max_output_tokens": 200
-            }
+            generation_config={"temperature": 0.2, "max_output_tokens": 200}
         )
-
-        answer = getattr(
-            response,
-            "text",
-            None
-        )
-
+        answer = getattr(response, "text", None)
         if answer:
             return answer.strip()
-
     except Exception as exc:
-
-        logger.error(
-            "GEMINI ERROR | %s: %s",
-            type(exc).__name__,
-            exc
-        )
+        logger.error("GEMINI ERROR | %s: %s", type(exc).__name__, exc)
 
     return None
 
 
 # ============================================================
-# MESSAGE HANDLER
+# MESSAGE HANDLER & DETERMINISTIC STATE MACHINE
 # ============================================================
 
-def handle_user_message(
-    phone: str,
-    msg_type: str,
-    text: str,
-    action_id: Optional[str] = None
-):
-
+def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optional[str] = None):
     conversation = get_conversation(phone)
-
-    current_state = conversation["state"]
-
-    selected_option = action_id or text
-
-    logger.info(
-        "INCOMING MESSAGE | USER=%s | TYPE=%s | "
-        "STATE=%s | ACTION=%s | TEXT=%s",
-        phone,
-        msg_type,
-        current_state,
-        action_id,
-        text
-    )
-
-    log_chat(
-        phone,
-        "incoming",
-        text,
-        msg_type
-    )
-
-    if action_id:
-        log_action(
-            phone,
-            action_id
-        )
-
+    current_state = conversation.get("state", "IDLE")
+    client_id = conversation.get("client_id", "glaze-dental")
     normalized = text.strip().lower()
 
-    # --------------------------------------------------------
-    # GLOBAL RESET
-    # --------------------------------------------------------
+    logger.info(
+        "INCOMING MESSAGE | USER=%s | CLIENT=%s | TYPE=%s | STATE=%s | ACTION=%s | TEXT=%s",
+        phone, client_id, msg_type, current_state, action_id, text
+    )
 
-    if normalized in {
-        "cancel",
-        "restart",
-        "reset",
-        "menu",
-        "main menu"
-    } or action_id == "cancel_booking":
+    log_chat(phone, "incoming", text, msg_type)
+    if action_id:
+        log_action(phone, action_id)
 
+    # --------------------------------------------------------
+    # 1. EMERGENCY CHECK (Priority: Before normal booking routing)
+    # --------------------------------------------------------
+    if is_emergency(text):
+        emergency_msg = (
+            "🚨 This may require urgent attention. Please call Glaze Dental Clinic at 9822977740 "
+            "immediately for emergency assistance."
+        )
+        send_text_message(phone, emergency_msg)
+        return
+
+    # --------------------------------------------------------
+    # 2. GLOBAL RESET / CANCEL
+    # --------------------------------------------------------
+    if normalized in {"cancel", "restart", "reset", "menu", "main menu"} or action_id in {"cancel_booking", "btn_cancel"}:
         reset_conversation(phone)
-
-        if normalized == "cancel" or action_id == "cancel_booking":
-            send_text_message(
-                phone,
-                "No problem. Your booking has been cancelled."
-            )
-
+        if normalized in {"cancel", "restart", "reset"} or action_id in {"cancel_booking", "btn_cancel"}:
+            send_text_message(phone, "Your booking process has been cancelled. Let us know whenever you'd like to book or ask a question.")
         return main_menu(phone)
 
     # --------------------------------------------------------
-    # GREETINGS
+    # 3. GREETINGS
     # --------------------------------------------------------
-
-    greetings = {
-        "hi",
-        "hii",
-        "hiii",
-        "hello",
-        "hey",
-        "hey there",
-        "good morning",
-        "good afternoon",
-        "good evening"
-    }
-
+    greetings = {"hi", "hii", "hiii", "hello", "hey", "hey there", "good morning", "good afternoon", "good evening"}
     if normalized in greetings and current_state == "IDLE":
+        reset_conversation(phone)
         return main_menu(phone)
 
     # --------------------------------------------------------
-    # MAIN MENU
+    # 4. PRICING INQUIRIES
     # --------------------------------------------------------
+    if is_pricing_question(text) and current_state == "IDLE":
+        price_msg = "Pricing details are not listed. Please contact Glaze Dental Clinic at 9822977740 for treatment charges."
+        send_text_message(phone, price_msg)
+        return main_menu(phone)
 
+    # --------------------------------------------------------
+    # 5. IDLE STATE
+    # --------------------------------------------------------
     if current_state == "IDLE":
+        if action_id in {"book_appointment", "btn_book"}:
+            update_conversation(phone, state="BOOKING_SERVICE")
+            return send_booking_services(phone)
 
-        if action_id == "book_appointment":
-            update_conversation(
-                phone,
-                state="BOOKING_SERVICE"
-            )
-
-            services = KNOWLEDGE.get(
-                "services",
-                []
-            )
-
-            rows = []
-
-            for index, service in enumerate(services[:10]):
-
-                if isinstance(service, str):
-                    name = service
-                    description = ""
-                else:
-                    name = service.get(
-                        "name",
-                        f"Service {index + 1}"
-                    )
-                    description = service.get(
-                        "description",
-                        ""
-                    )
-
-                rows.append(
-                    {
-                        "id": f"booking_service_{index}",
-                        "title": name,
-                        "description": description
-                    }
-                )
-
-            if not rows:
-                return send_text_message(
-                    phone,
-                    "Please contact the clinic to book an appointment."
-                )
-
-            return send_list_message(
-                phone,
-                "What service would you like to book?",
-                "Choose service",
-                rows
-            )
-
-        if action_id == "services":
+        if action_id in {"services", "btn_services"}:
             return send_services(phone)
 
-        if action_id == "clinic_info":
+        if action_id in {"clinic_info", "btn_info"}:
             return send_clinic_info(phone)
 
-        # Free-text question
+        # Free-text Q&A
         answer = ask_gemini(text)
-
         if answer:
-            send_text_message(
-                phone,
-                answer
-            )
+            send_text_message(phone, answer)
         else:
-            send_text_message(
-                phone,
-                "I can help with appointments, services, "
-                "and clinic information."
-            )
-
+            send_text_message(phone, "I can help with appointment bookings, services, and clinic information.")
         return main_menu(phone)
 
     # --------------------------------------------------------
-    # BOOKING SERVICE
+    # 6. BOOKING_SERVICE
     # --------------------------------------------------------
-
     if current_state == "BOOKING_SERVICE":
-
         service = None
+        services = KNOWLEDGE.get("services", [])
 
-        if action_id and action_id.startswith(
-            "booking_service_"
-        ):
+        if action_id and action_id.startswith("booking_service_"):
             try:
-                index = int(
-                    action_id.replace(
-                        "booking_service_",
-                        ""
-                    )
-                )
-
-                services = KNOWLEDGE.get(
-                    "services",
-                    []
-                )
-
-                if 0 <= index < len(services):
-
-                    selected = services[index]
-
-                    if isinstance(selected, str):
-                        service = selected
-                    else:
-                        service = selected.get(
-                            "name"
-                        )
-
+                idx = int(action_id.replace("booking_service_", ""))
+                if 0 <= idx < len(services):
+                    item = services[idx]
+                    service = item if isinstance(item, str) else item.get("name")
             except (ValueError, IndexError):
                 service = None
 
         if not service:
-            services = KNOWLEDGE.get(
-                "services",
-                []
-            )
-
             for item in services:
-
-                name = (
-                    item
-                    if isinstance(item, str)
-                    else item.get("name", "")
-                )
-
-                if name.lower() == normalized:
+                name = item if isinstance(item, str) else item.get("name", "")
+                if name.lower() == normalized or normalized in name.lower():
                     service = name
                     break
 
         if not service:
+            send_text_message(phone, "Please choose one of the available dental services below:")
+            return send_booking_services(phone)
 
-            send_text_message(
-                phone,
-                "Please choose one of the available services."
-            )
+        update_conversation(phone, state="BOOKING_NAME", service=service)
+        send_text_message(phone, f"You selected: *{service}*.\n\nPlease provide the patient's *full name*:")
+        return
 
-            return send_services(phone)
+    # --------------------------------------------------------
+    # 7. BOOKING_NAME
+    # --------------------------------------------------------
+    if current_state == "BOOKING_NAME":
+        patient_name = text.strip()
+        if len(patient_name) < 2 or patient_name.isdigit():
+            send_text_message(phone, "Please enter a valid patient name (e.g. Rahul Sharma):")
+            return
 
-        update_conversation(
-            phone,
-            state="BOOKING_DATE",
-            service=service
-        )
+        update_conversation(phone, state="BOOKING_PATIENT_TYPE", patient_name=patient_name)
+        return send_patient_type_options(phone)
 
-        send_text_message(
-            phone,
-            f"Great. You selected: {service}"
-        )
+    # --------------------------------------------------------
+    # 8. BOOKING_PATIENT_TYPE
+    # --------------------------------------------------------
+    if current_state == "BOOKING_PATIENT_TYPE":
+        patient_type = None
+        if action_id == "patient_new" or "new" in normalized:
+            patient_type = "New"
+        elif action_id == "patient_existing" or "existing" in normalized:
+            patient_type = "Existing"
 
+        if not patient_type:
+            send_text_message(phone, "Please indicate whether you are a new or existing patient:")
+            return send_patient_type_options(phone)
+
+        update_conversation(phone, state="BOOKING_DATE", patient_type=patient_type)
         return send_date_options(phone)
 
     # --------------------------------------------------------
-    # BOOKING DATE
+    # 9. BOOKING_DATE
     # --------------------------------------------------------
-
     if current_state == "BOOKING_DATE":
-
         appointment_date = None
 
         if action_id and action_id.startswith("date_"):
-            appointment_date = action_id.replace(
-                "date_",
-                ""
-            )
-
+            appointment_date = action_id.replace("date_", "")
         elif action_id == "choose_date":
-
-            send_text_message(
-                phone,
-                "Please send the date in this format:\n"
-                "YYYY-MM-DD\n\n"
-                "Example: 2026-09-20"
-            )
-
-            return None
-
+            send_text_message(phone, "Please send your preferred date in YYYY-MM-DD format (for example: 2026-09-20):")
+            return
         else:
-            appointment_date = parse_date_input(
-                text
-            )
+            appointment_date = parse_date_input(text)
 
         if not appointment_date:
+            send_text_message(phone, "I couldn't recognize that date. Please use YYYY-MM-DD (e.g., 2026-09-20) or choose Today/Tomorrow:")
+            return send_date_options(phone)
 
+        # Query CRM for live available slots
+        available_slots = get_available_slots(client_id, appointment_date)
+
+        if available_slots is None:
+            # CRM API error
             send_text_message(
                 phone,
-                "I couldn't understand that date.\n\n"
-                "Please use YYYY-MM-DD, for example "
-                "2026-09-20."
+                "Sorry, I'm unable to check live appointment availability right now. "
+                "Please try again shortly or call Glaze Dental Clinic at 9822977740."
             )
+            return
 
-            return None
+        if not available_slots:
+            # Successfully checked CRM, but zero slots available
+            send_text_message(
+                phone,
+                f"There are no available slots on {appointment_date}. Please select another date:"
+            )
+            return send_date_options(phone)
 
-        update_conversation(
-            phone,
-            state="BOOKING_TIME",
-            appointment_date=appointment_date
-        )
-
-        return send_time_options(phone)
+        update_conversation(phone, state="BOOKING_TIME", appointment_date=appointment_date)
+        rows = [{"id": f"time_{slot}", "title": slot[:24], "description": "Available"} for slot in available_slots[:10]]
+        return send_list_message(phone, f"Available slots for *{appointment_date}*:", "Choose time", rows)
 
     # --------------------------------------------------------
-    # BOOKING TIME
+    # 10. BOOKING_TIME
     # --------------------------------------------------------
-
     if current_state == "BOOKING_TIME":
+        appointment_date = conversation.get("appointment_date")
 
-        appointment_time = None
-
-        if action_id and action_id.startswith(
-            "time_"
-        ):
-            appointment_time = action_id.replace(
-                "time_",
-                ""
-            )
-
+        selected_time = None
+        if action_id and action_id.startswith("time_"):
+            # Trust the action_id directly — it was built from our own CRM slot list
+            selected_time = action_id[len("time_"):]
         else:
-
-            available_times = [
-                "10:00 AM",
-                "11:00 AM",
-                "12:00 PM",
-                "02:00 PM",
-                "03:00 PM",
-                "04:00 PM",
-                "05:00 PM"
-            ]
-
-            for available_time in available_times:
-
-                if normalized == available_time.lower():
-                    appointment_time = available_time
+            # Text-based fallback: re-query CRM to validate the typed time
+            available_slots = get_available_slots(client_id, appointment_date) if appointment_date else None
+            if available_slots is None:
+                send_text_message(
+                    phone,
+                    "Sorry, I'm unable to check live appointment availability right now. "
+                    "Please try again shortly or call Glaze Dental Clinic at 9822977740."
+                )
+                return
+            for s in available_slots:
+                if normalized == s.lower():
+                    selected_time = s
                     break
 
-        if not appointment_time:
+            if not selected_time:
+                send_text_message(phone, "Please select one of the available slots listed below:")
+                rows = [{"id": f"time_{slot}", "title": slot[:24], "description": "Available"} for slot in available_slots[:10]]
+                return send_list_message(phone, f"Available slots for *{appointment_date}*:", "Choose time", rows)
 
-            send_text_message(
-                phone,
-                "Please choose one of the available appointment times."
-            )
+        update_conversation(phone, state="BOOKING_CONFIRMATION", appointment_time=selected_time)
 
-            return send_time_options(phone)
+        service_val = conversation.get("service", "Dental consultation")
+        name_val = conversation.get("patient_name", "Patient")
+        ptype_val = conversation.get("patient_type", "New")
 
-        update_conversation(
-            phone,
-            state="BOOKING_CONFIRMATION",
-            appointment_time=appointment_time
-        )
-
-        conversation = get_conversation(phone)
-
-        date_value = conversation[
-            "appointment_date"
-        ]
-
-        service_value = conversation[
-            "service"
-        ]
-
-        body = (
+        summary = (
             "Please confirm your appointment:\n\n"
-            f"🦷 Service: {service_value}\n"
-            f"📅 Date: {date_value}\n"
-            f"⏰ Time: {appointment_time}"
+            f"👤 Name: {name_val}\n"
+            f"📋 Patient: {ptype_val} patient\n"
+            f"🦷 Service: {service_val}\n"
+            f"📅 Date: {appointment_date}\n"
+            f"⏰ Time: {selected_time}\n\n"
+            "Would you like to confirm?"
         )
-
-        return send_button_message(
-            phone,
-            body,
-            [
-                {
-                    "id": "confirm_booking",
-                    "title": "Confirm"
-                },
-                {
-                    "id": "change_booking",
-                    "title": "Change"
-                },
-                {
-                    "id": "cancel_booking",
-                    "title": "Cancel"
-                }
-            ]
-        )
+        buttons = [
+            {"id": "confirm_booking", "title": "Confirm"},
+            {"id": "cancel_booking", "title": "Cancel"}
+        ]
+        return send_button_message(phone, summary, buttons)
 
     # --------------------------------------------------------
-    # BOOKING CONFIRMATION
+    # 11. BOOKING_CONFIRMATION
     # --------------------------------------------------------
-
     if current_state == "BOOKING_CONFIRMATION":
+        if action_id == "confirm_booking" or normalized in {"confirm", "yes", "ok"}:
+            c_name = conversation.get("patient_name", "")
+            c_service = conversation.get("service", "")
+            c_ptype = conversation.get("patient_type", "")
+            c_date = conversation.get("appointment_date", "")
+            c_time = conversation.get("appointment_time", "")
 
-        if action_id == "confirm_booking":
-
-            conversation = get_conversation(phone)
-
-            service = conversation["service"]
-            appointment_date = conversation[
-                "appointment_date"
-            ]
-            appointment_time = conversation[
-                "appointment_time"
-            ]
-
-            save_appointment(
-                phone=phone,
-                service=service,
-                appointment_date=appointment_date,
-                appointment_time=appointment_time
+            # Call CRM booking endpoint
+            res = book_appointment(
+                client_id=client_id,
+                customer_name=c_name,
+                customer_phone=phone,
+                booking_date=c_date,
+                booking_time=c_time
             )
 
-            logger.info(
-                "APPOINTMENT CONFIRMED | USER=%s | "
-                "SERVICE=%s | DATE=%s | TIME=%s",
-                phone,
-                service,
-                appointment_date,
-                appointment_time
-            )
+            status = res.get("status")
+            data = res.get("data", {})
 
+            if status == "success":
+                # 201 Created
+                crm_apt_id = data.get("appointmentId") or data.get("id") or data.get("appointment", {}).get("id")
+                save_appointment_record(
+                    phone=phone,
+                    client_id=client_id,
+                    service=c_service,
+                    patient_name=c_name,
+                    patient_type=c_ptype,
+                    appointment_date=c_date,
+                    appointment_time=c_time,
+                    crm_appointment_id=crm_apt_id
+                )
+                reset_conversation(phone)
+
+                confirmation_msg = (
+                    f"✅ Your appointment has been confirmed at {clinic_name()}.\n\n"
+                    f"Date: {c_date}\n"
+                    f"Time: {c_time}\n"
+                    f"Service: {c_service}\n\n"
+                    "Thank you!"
+                )
+                send_text_message(phone, confirmation_msg)
+                return main_menu(phone)
+
+            elif status == "conflict":
+                # 409 Conflict: Slot was booked by someone else
+                send_text_message(
+                    phone,
+                    "Sorry, that time slot is already booked. Please choose another available time."
+                )
+                fresh_slots = get_available_slots(client_id, c_date)
+                if fresh_slots:
+                    update_conversation(phone, state="BOOKING_TIME")
+                    rows = [{"id": f"time_{slot}", "title": slot[:24], "description": "Available"} for slot in fresh_slots[:10]]
+                    return send_list_message(phone, f"Fresh available slots for *{c_date}*:", "Choose time", rows)
+                else:
+                    update_conversation(phone, state="BOOKING_DATE")
+                    send_text_message(phone, f"No more slots remain on {c_date}. Please choose another date:")
+                    return send_date_options(phone)
+
+            else:
+                # Other CRM failure
+                send_text_message(
+                    phone,
+                    "I couldn't confirm the appointment right now. "
+                    "Please try again shortly or call Glaze Dental Clinic at 9822977740."
+                )
+                return main_menu(phone)
+
+        elif action_id in {"cancel_booking", "btn_cancel"} or normalized in {"cancel", "no"}:
             reset_conversation(phone)
-
-            send_text_message(
-                phone,
-                "✅ Your appointment has been confirmed!\n\n"
-                f"🦷 {service}\n"
-                f"📅 {appointment_date}\n"
-                f"⏰ {appointment_time}\n\n"
-                "Thank you!"
-            )
-
+            send_text_message(phone, "Your appointment booking has been cancelled.")
             return main_menu(phone)
 
-        if action_id == "change_booking":
-
-            update_conversation(
-                phone,
-                state="BOOKING_SERVICE",
-                service=None,
-                appointment_date=None,
-                appointment_time=None
-            )
-
-            return send_text_message(
-                phone,
-                "Sure. Let's start again."
-            ) and send_services(phone)
-
-        if action_id == "cancel_booking":
-
-            reset_conversation(phone)
-
-            send_text_message(
-                phone,
-                "Your appointment booking has been cancelled."
-            )
-
-            return main_menu(phone)
-
-        send_text_message(
-            phone,
-            "Please choose Confirm, Change, or Cancel."
-        )
-
-        return None
+        else:
+            send_text_message(phone, "Please choose Confirm or Cancel:")
+            buttons = [
+                {"id": "confirm_booking", "title": "Confirm"},
+                {"id": "cancel_booking", "title": "Cancel"}
+            ]
+            return send_button_message(phone, "Would you like to confirm your appointment?", buttons)
 
     # --------------------------------------------------------
-    # FALLBACK
+    # 12. FALLBACK
     # --------------------------------------------------------
-
     reset_conversation(phone)
-
-    answer = ask_gemini(text)
-
-    if answer:
-        send_text_message(
-            phone,
-            answer
-        )
-    else:
-        send_text_message(
-            phone,
-            "I'm sorry, I couldn't process that request."
-        )
-
+    send_text_message(phone, f"Welcome to {clinic_name()}. Send 'hi' to see the main menu.")
     return main_menu(phone)
 
 
 # ============================================================
-# META WEBHOOK VERIFICATION
+# META WEBHOOK VERIFICATION & RECEIVER
 # ============================================================
 
 @app.get("/webhook")
 async def verify_webhook(
-    hub_mode: Optional[str] = Query(
-        default=None,
-        alias="hub.mode"
-    ),
-    hub_verify_token: Optional[str] = Query(
-        default=None,
-        alias="hub.verify_token"
-    ),
-    hub_challenge: Optional[str] = Query(
-        default=None,
-        alias="hub.challenge"
-    )
+    hub_mode: Optional[str] = Query(default=None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(default=None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(default=None, alias="hub.challenge")
 ):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        logger.info("WEBHOOK VERIFICATION SUCCESS")
+        return PlainTextResponse(hub_challenge or "")
 
-    logger.info(
-        "WEBHOOK VERIFICATION | MODE=%s | TOKEN_MATCH=%s",
-        hub_mode,
-        hub_verify_token == VERIFY_TOKEN
-    )
+    logger.warning("WEBHOOK VERIFICATION FAILED")
+    return PlainTextResponse("Forbidden", status_code=403)
 
-    if (
-        hub_mode == "subscribe"
-        and hub_verify_token == VERIFY_TOKEN
-    ):
-
-        logger.info(
-            "WEBHOOK VERIFICATION SUCCESS"
-        )
-
-        return PlainTextResponse(
-            hub_challenge or ""
-        )
-
-    logger.warning(
-        "WEBHOOK VERIFICATION FAILED"
-    )
-
-    return PlainTextResponse(
-        "Forbidden",
-        status_code=403
-    )
-
-
-# ============================================================
-# META WEBHOOK RECEIVER
-# ============================================================
 
 @app.post("/webhook")
-async def whatsapp_webhook(
-    request: Request
-):
-
-    logger.info(
-        "=================================================="
-    )
-
-    logger.info(
-        "WEBHOOK RECEIVED"
-    )
-
-    logger.info(
-        "METHOD=%s | PATH=%s | CONTENT_TYPE=%s",
-        request.method,
-        request.url.path,
-        request.headers.get("content-type")
-    )
-
-    # --------------------------------------------------------
-    # READ RAW BODY FIRST
-    # --------------------------------------------------------
-
+async def whatsapp_webhook(request: Request):
     try:
-
         raw_body = await request.body()
-
-        logger.info(
-            "WEBHOOK BODY | BYTES=%d",
-            len(raw_body)
-        )
-
     except Exception as exc:
-
-        logger.error(
-            "WEBHOOK BODY READ ERROR | %s: %s",
-            type(exc).__name__,
-            exc,
-            exc_info=True
-        )
-
-        return JSONResponse(
-            {
-                "status": "body_read_error"
-            },
-            status_code=200
-        )
-
-    # --------------------------------------------------------
-    # EMPTY BODY
-    # --------------------------------------------------------
+        logger.error("WEBHOOK BODY READ ERROR | %s: %s", type(exc).__name__, exc)
+        return JSONResponse({"status": "body_read_error"}, status_code=200)
 
     if not raw_body:
-
-        logger.error(
-            "WEBHOOK EMPTY BODY"
-        )
-
-        return JSONResponse(
-            {
-                "status": "invalid_json",
-                "reason": "empty_body"
-            },
-            status_code=200
-        )
-
-    # --------------------------------------------------------
-    # PARSE JSON
-    # --------------------------------------------------------
+        return JSONResponse({"status": "invalid_json", "reason": "empty_body"}, status_code=200)
 
     try:
-
-        body_text = raw_body.decode(
-            "utf-8"
-        )
-
-        logger.info(
-            "WEBHOOK RAW BODY | %s",
-            body_text[:3000]
-        )
-
-        body = json.loads(
-            body_text
-        )
-
-    except UnicodeDecodeError as exc:
-
-        logger.error(
-            "WEBHOOK UTF8 ERROR | %s",
-            exc,
-            exc_info=True
-        )
-
-        return JSONResponse(
-            {
-                "status": "invalid_json",
-                "reason": "invalid_utf8"
-            },
-            status_code=200
-        )
-
-    except json.JSONDecodeError as exc:
-
-        logger.error(
-            "WEBHOOK JSON PARSE ERROR | "
-            "LINE=%s COLUMN=%s MSG=%s",
-            exc.lineno,
-            exc.colno,
-            exc.msg,
-            exc_info=True
-        )
-
-        logger.error(
-            "WEBHOOK INVALID BODY | %s",
-            raw_body[:3000]
-        )
-
-        return JSONResponse(
-            {
-                "status": "invalid_json",
-                "reason": "json_decode_error"
-            },
-            status_code=200
-        )
-
-    # --------------------------------------------------------
-    # VALID JSON
-    # --------------------------------------------------------
-
-    logger.info(
-        "WEBHOOK JSON PARSED | TYPE=%s",
-        body.get("object")
-    )
+        body = json.loads(raw_body.decode("utf-8"))
+    except Exception as exc:
+        logger.error("WEBHOOK JSON PARSE ERROR | %s", exc)
+        return JSONResponse({"status": "invalid_json", "reason": "json_decode_error"}, status_code=200)
 
     if body.get("object") != "whatsapp_business_account":
-
-        logger.warning(
-            "WEBHOOK IGNORED | OBJECT=%s",
-            body.get("object")
-        )
-
-        return JSONResponse(
-            {
-                "status": "ignored",
-                "reason": "invalid_object"
-            }
-        )
+        return JSONResponse({"status": "ignored", "reason": "invalid_object"})
 
     processed = 0
+    entries = body.get("entry", [])
 
-    # --------------------------------------------------------
-    # ENTRIES
-    # --------------------------------------------------------
+    for entry in entries:
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            messages = value.get("messages", [])
 
-    entries = body.get(
-        "entry",
-        []
-    )
-
-    logger.info(
-        "WEBHOOK ENTRIES | COUNT=%d",
-        len(entries)
-    )
-
-    for entry_index, entry in enumerate(entries):
-
-        logger.info(
-            "PROCESSING ENTRY | INDEX=%d | ID=%s",
-            entry_index,
-            entry.get("id")
-        )
-
-        changes = entry.get(
-            "changes",
-            []
-        )
-
-        logger.info(
-            "ENTRY CHANGES | COUNT=%d",
-            len(changes)
-        )
-
-        # ----------------------------------------------------
-        # CHANGES
-        # ----------------------------------------------------
-
-        for change_index, change in enumerate(changes):
-
-            value = change.get(
-                "value",
-                {}
-            )
-
-            logger.info(
-                "PROCESSING CHANGE | INDEX=%d | FIELD=%s",
-                change_index,
-                change.get("field")
-            )
-
-            metadata = value.get(
-                "metadata",
-                {}
-            )
-
-            logger.info(
-                "WEBHOOK METADATA | PHONE_NUMBER_ID=%s",
-                metadata.get("phone_number_id")
-            )
-
-            # ------------------------------------------------
-            # STATUS EVENTS
-            # ------------------------------------------------
-
-            statuses = value.get(
-                "statuses",
-                []
-            )
-
-            if statuses:
-
-                logger.info(
-                    "WHATSAPP STATUSES | COUNT=%d",
-                    len(statuses)
-                )
-
-                for status in statuses:
-
-                    logger.info(
-                        "MESSAGE STATUS | ID=%s | STATUS=%s | "
-                        "RECIPIENT=%s | ERRORS=%s",
-                        status.get("id"),
-                        status.get("status"),
-                        status.get("recipient_id"),
-                        status.get("errors")
-                    )
-
-            # ------------------------------------------------
-            # MESSAGES
-            # ------------------------------------------------
-
-            messages = value.get(
-                "messages",
-                []
-            )
-
-            logger.info(
-                "WEBHOOK MESSAGES | COUNT=%d",
-                len(messages)
-            )
-
-            for message_index, message in enumerate(
-                messages
-            ):
-
-                logger.info(
-                    "PROCESSING MESSAGE | INDEX=%d | ID=%s",
-                    message_index,
-                    message.get("id")
-                )
-
-                sender = message.get(
-                    "from"
-                )
-
-                msg_type = message.get(
-                    "type",
-                    "unknown"
-                )
-
+            for message in messages:
+                sender = message.get("from")
+                msg_type = message.get("type", "unknown")
                 if not sender:
-
-                    logger.warning(
-                        "MESSAGE IGNORED | NO SENDER"
-                    )
-
                     continue
 
                 text_content = ""
                 action_id = None
 
-                # --------------------------------------------
-                # TEXT
-                # --------------------------------------------
-
                 if msg_type == "text":
-
-                    text_content = (
-                        message
-                        .get("text", {})
-                        .get("body", "")
-                        .strip()
-                    )
-
-                # --------------------------------------------
-                # INTERACTIVE
-                # --------------------------------------------
-
+                    text_content = message.get("text", {}).get("body", "").strip()
                 elif msg_type == "interactive":
-
-                    interactive = message.get(
-                        "interactive",
-                        {}
-                    )
-
-                    interactive_type = interactive.get(
-                        "type"
-                    )
-
-                    logger.info(
-                        "INTERACTIVE MESSAGE | TYPE=%s",
-                        interactive_type
-                    )
-
-                    if interactive_type == "button_reply":
-
-                        button_reply = interactive.get(
-                            "button_reply",
-                            {}
-                        )
-
-                        action_id = button_reply.get(
-                            "id"
-                        )
-
-                        text_content = button_reply.get(
-                            "title",
-                            ""
-                        ).strip()
-
-                    elif interactive_type == "list_reply":
-
-                        list_reply = interactive.get(
-                            "list_reply",
-                            {}
-                        )
-
-                        action_id = list_reply.get(
-                            "id"
-                        )
-
-                        text_content = list_reply.get(
-                            "title",
-                            ""
-                        ).strip()
-
-                # --------------------------------------------
-                # OTHER MESSAGE TYPES
-                # --------------------------------------------
-
-                else:
-
-                    logger.info(
-                        "UNSUPPORTED MESSAGE TYPE | %s",
-                        msg_type
-                    )
-
-                logger.info(
-                    "MESSAGE EXTRACTED | USER=%s | "
-                    "TYPE=%s | ACTION=%s | TEXT=%s",
-                    sender,
-                    msg_type,
-                    action_id,
-                    text_content
-                )
+                    interactive = message.get("interactive", {})
+                    itype = interactive.get("type")
+                    if itype == "button_reply":
+                        btn = interactive.get("button_reply", {})
+                        action_id = btn.get("id")
+                        text_content = btn.get("title", "").strip()
+                    elif itype == "list_reply":
+                        litem = interactive.get("list_reply", {})
+                        action_id = litem.get("id")
+                        text_content = litem.get("title", "").strip()
 
                 if not text_content and not action_id:
-
-                    logger.warning(
-                        "MESSAGE IGNORED | NO TEXT/ACTION"
-                    )
-
                     continue
 
-                # --------------------------------------------
-                # HANDLE MESSAGE
-                # --------------------------------------------
-
                 try:
-
                     handle_user_message(
                         phone=sender,
                         msg_type=msg_type,
                         text=text_content,
                         action_id=action_id
                     )
-
                     processed += 1
-
-                    logger.info(
-                        "MESSAGE PROCESSED SUCCESSFULLY | USER=%s",
-                        sender
-                    )
-
                 except Exception as exc:
-
-                    logger.error(
-                        "MESSAGE HANDLER ERROR | USER=%s | "
-                        "%s: %s",
-                        sender,
-                        type(exc).__name__,
-                        exc,
-                        exc_info=True
-                    )
-
-                    # Do not return 500 to Meta.
-                    # Meta can retry failed webhooks.
+                    logger.error("MESSAGE HANDLER ERROR | USER=%s | %s: %s", sender, type(exc).__name__, exc, exc_info=True)
                     try:
-                        send_text_message(
-                            sender,
-                            "Sorry, something went wrong. "
-                            "Please try again."
-                        )
-                    except Exception as send_exc:
-                        logger.error(
-                            "ERROR MESSAGE SEND FAILED | %s: %s",
-                            type(send_exc).__name__,
-                            send_exc,
-                            exc_info=True
-                        )
+                        send_text_message(sender, "Sorry, something went wrong. Please try again.")
+                    except Exception:
+                        pass
 
-    logger.info(
-        "WEBHOOK COMPLETE | PROCESSED=%d",
-        processed
-    )
-
-    logger.info(
-        "=================================================="
-    )
-
-    return JSONResponse(
-        {
-            "status": "ok",
-            "processed": processed
-        },
-        status_code=200
-    )
+    return JSONResponse({"status": "ok", "processed": processed}, status_code=200)
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH & DASHBOARD / PORTAL ENDPOINTS
 # ============================================================
 
 @app.get("/")
 async def root():
-
     return {
         "status": "ok",
-        "service": "Nextlite WhatsApp AI",
+        "service": "Glaze Dental Clinic WhatsApp AI",
         "webhook": "/webhook",
         "graph_api_version": GRAPH_API_VERSION
     }
 
 
-# ============================================================
-# LOCAL TEST ENDPOINT
-# ============================================================
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_portal(client_id: str = "glaze-dental"):
+    config = get_client_crm_config(client_id) or {
+        "client_id": client_id,
+        "client_name": "Glaze Dental Clinic",
+        "crm_base_url": "",
+        "crm_tenant_id": ""
+    }
 
-@app.post("/test-message")
-async def test_message(
-    request: Request
-):
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>WhatsApp CRM Configuration</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f4f6f8; margin: 0; padding: 30px; }}
+        .card {{ max-width: 600px; margin: 0 auto; background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+        h2 {{ margin-top: 0; color: #1e293b; }}
+        .form-group {{ margin-bottom: 16px; }}
+        label {{ display: block; font-weight: 600; margin-bottom: 6px; color: #334155; }}
+        input[type="text"] {{ width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }}
+        .btn {{ background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }}
+        .btn:hover {{ background: #1d4ed8; }}
+        .btn-test {{ background: #059669; margin-left: 8px; }}
+        .btn-test:hover {{ background: #047857; }}
+        #status {{ margin-top: 15px; font-weight: 600; }}
+        .success {{ color: #059669; }}
+        .error {{ color: #dc2626; }}
+    </style>
+</head>
+<body>
+<div class="card">
+    <h2>CRM Integration & Client Settings</h2>
+    <form id="crmForm">
+        <div class="form-group">
+            <label>Client ID</label>
+            <input type="text" id="clientId" value="{config['client_id']}" readonly style="background: #f1f5f9;">
+        </div>
+        <div class="form-group">
+            <label>Client Name</label>
+            <input type="text" id="clientName" value="{config['client_name']}" required>
+        </div>
+        <div class="form-group">
+            <label>CRM API Base URL</label>
+            <input type="text" id="crmBaseUrl" value="{config['crm_base_url']}" placeholder="https://dandelion-gigantic-challenge.ngrok-free.dev" required>
+        </div>
+        <div class="form-group">
+            <label>Tenant ID (X-Tenant-Key)</label>
+            <input type="text" id="crmTenantId" value="{config['crm_tenant_id']}" placeholder="6b4b6128-5b5f-4d2f-b5de-91511ab9b120" required>
+        </div>
+        <div>
+            <button type="submit" class="btn">Save CRM Configuration</button>
+            <button type="button" class="btn btn-test" onclick="testConnection()">Test CRM Connection</button>
+        </div>
+    </form>
+    <div id="status"></div>
+</div>
 
+<script>
+document.getElementById('crmForm').onsubmit = async (e) => {{
+    e.preventDefault();
+    const statusDiv = document.getElementById('status');
+    statusDiv.textContent = 'Saving...';
+    statusDiv.className = '';
+    
+    try {{
+        const res = await fetch('/api/client-config', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+                client_id: document.getElementById('clientId').value,
+                client_name: document.getElementById('clientName').value,
+                crm_base_url: document.getElementById('crmBaseUrl').value,
+                crm_tenant_id: document.getElementById('crmTenantId').value
+            }})
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+            statusDiv.textContent = 'Configuration saved successfully!';
+            statusDiv.className = 'success';
+        }} else {{
+            statusDiv.textContent = 'Error: ' + (data.detail || data.error || 'Save failed');
+            statusDiv.className = 'error';
+        }}
+    }} catch (err) {{
+        statusDiv.textContent = 'Error saving configuration.';
+        statusDiv.className = 'error';
+    }}
+}};
+
+async function testConnection() {{
+    const statusDiv = document.getElementById('status');
+    statusDiv.textContent = 'Testing connection...';
+    statusDiv.className = '';
+    
+    try {{
+        const clientId = document.getElementById('clientId').value;
+        const res = await fetch(`/api/test-crm-connection?client_id=${{encodeURIComponent(clientId)}}`);
+        const data = await res.json();
+        if (data.status === 'success') {{
+            statusDiv.textContent = 'Connection successful! (CRM slots verified)';
+            statusDiv.className = 'success';
+        }} else {{
+            statusDiv.textContent = 'Connection failed: ' + (data.message || 'Unable to reach CRM');
+            statusDiv.className = 'error';
+        }}
+    }} catch (err) {{
+        statusDiv.textContent = 'Connection failed';
+        statusDiv.className = 'error';
+    }}
+}}
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+
+@app.get("/api/client-config")
+async def get_client_config_api(client_id: str = "glaze-dental"):
+    config = get_client_crm_config(client_id)
+    if not config:
+        return JSONResponse({"status": "error", "message": "Client not found"}, status_code=404)
+    return {
+        "client_id": config["client_id"],
+        "client_name": config["client_name"],
+        "crm_base_url": config["crm_base_url"],
+        "crm_tenant_id": config["crm_tenant_id"]
+    }
+
+
+@app.post("/api/client-config")
+async def save_client_config_api(request: Request):
     try:
-
         body = await request.json()
+        client_id = body.get("client_id", "glaze-dental")
+        client_name = body.get("client_name", "Glaze Dental Clinic")
+        crm_base_url = body.get("crm_base_url", "")
+        crm_tenant_id = body.get("crm_tenant_id", "")
 
-    except Exception:
-
-        return JSONResponse(
-            {
-                "status": "invalid_json"
-            },
-            status_code=400
+        save_client_crm_config(
+            client_id=client_id,
+            client_name=client_name,
+            crm_base_url=crm_base_url,
+            crm_tenant_id=crm_tenant_id
         )
-
-    phone = body.get(
-        "phone"
-    )
-
-    text = body.get(
-        "text",
-        ""
-    )
-
-    if not phone or not text:
-
-        return JSONResponse(
-            {
-                "status": "error",
-                "message": "phone and text are required"
-            },
-            status_code=400
-        )
-
-    try:
-
-        handle_user_message(
-            phone=phone,
-            msg_type="text",
-            text=text,
-            action_id=None
-        )
-
-        return {
-            "status": "ok"
-        }
-
+        return {"status": "success", "message": "CRM configuration saved successfully"}
+    except ValueError as val_err:
+        return JSONResponse({"status": "error", "message": str(val_err)}, status_code=400)
     except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
-        logger.error(
-            "TEST MESSAGE ERROR | %s: %s",
-            type(exc).__name__,
-            exc,
-            exc_info=True
-        )
 
+@app.get("/api/test-crm-connection")
+async def test_crm_connection_endpoint(client_id: str = "glaze-dental", test_date: str = "2026-09-16"):
+    slots = get_available_slots(client_id, test_date)
+    if slots is not None:
+        return {
+            "status": "success",
+            "message": "Connection successful",
+            "date_tested": test_date,
+            "available_slots_count": len(slots)
+        }
+    else:
         return JSONResponse(
             {
                 "status": "error",
-                "error": str(exc)
+                "message": "Connection failed. Check CRM API URL and Tenant ID."
             },
-            status_code=500
+            status_code=502
         )

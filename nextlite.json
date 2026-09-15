@@ -1,8 +1,38 @@
 {
-  "company":{"name":"Nextlite","description":"A demo business providing customer communication and business workflow automation.","location":"Nagpur, Maharashtra, India"},
-  "business_hours":{"monday_to_friday":"9:00 AM to 6:00 PM","saturday":"10:00 AM to 2:00 PM","sunday":"Closed"},
-  "products":["Nextlite Connect","Nextlite Assist"],
-  "services":["Customer communication automation","AI assistant setup","Business workflow automation"],
-  "refund_policy":"Refunds are handled on a case-by-case basis.",
-  "contact":{"email":"hello@example.com"}
+  "company": {
+    "name": "SmileCare Dental Clinic (Demo)",
+    "description": "A modern dental practice providing high-quality preventive, restorative, and cosmetic dental care.",
+    "location": "Nagpur, Maharashtra, India"
+  },
+  "business_hours": {
+    "monday_to_friday": "9:00 AM to 7:00 PM",
+    "saturday": "9:00 AM to 3:00 PM",
+    "sunday": "Closed (Emergency on call)"
+  },
+  "services": [
+    "Dental consultation",
+    "Teeth cleaning",
+    "Root canal consultation",
+    "Cavity fillings",
+    "Teeth whitening"
+  ],
+  "clinic_info": {
+    "about": "SmileCare Dental Clinic offers compassionate dental treatments using modern technology and strict sterilization protocols.",
+    "emergency": "For urgent dental trauma or severe pain after hours, please contact our emergency helpline or visit our clinic during open hours.",
+    "consultation_policy": "New patient consultations typically take 30-45 minutes including initial examination and dental X-rays if needed."
+  },
+  "contact": {
+    "phone": "+91 98765 43210",
+    "email": "care@smilecaredental.demo",
+    "address": "SmileCare Dental Clinic, Civil Lines, Nagpur, Maharashtra, India"
+  },
+  "refund_policy": "Appointment cancellations or rescheduling requests can be made up to 4 hours in advance at no charge.",
+  "appointment": {
+    "demo_slots": [
+      "10:00 AM",
+      "11:30 AM",
+      "2:00 PM",
+      "4:30 PM"
+    ]
+  }
 }

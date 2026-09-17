@@ -3,8 +3,10 @@ import json
 import logging
 import sqlite3
 import datetime
+import asyncio
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 import google.generativeai as genai
@@ -14,24 +16,26 @@ from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 
 
 # ============================================================
-# APP
+# APP INITIALIZATION
 # ============================================================
 
 app = FastAPI(title="Glaze Dental Clinic WhatsApp AI")
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "nextlite-demo")
 WHATSAPP_TOKEN = os.getenv("META_WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "1208541249018781")
 GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v26.0")
+REMINDER_TEMPLATE_NAME = os.getenv("META_REMINDER_TEMPLATE", "glaze_appointment_1h_reminder")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 DB_PATH = "nextlite.db"
 KNOWLEDGE_PATH = "nextlite.json"
+TIMEZONE_KOLKATA = ZoneInfo("Asia/Kolkata")
 
 
 # ============================================================
@@ -42,12 +46,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-
 logger = logging.getLogger("nextlite")
 
 
 # ============================================================
-# GEMINI
+# GEMINI AI
 # ============================================================
 
 gemini_model = None
@@ -62,20 +65,21 @@ if GEMINI_API_KEY:
 
 
 # ============================================================
-# KNOWLEDGE BASE
+# KNOWLEDGE BASE & SERVICE CONFIGURATION
 # ============================================================
 
 DEFAULT_KNOWLEDGE = {
     "client_id": "glaze-dental",
     "client_name": "Glaze Dental Clinic",
-    "crm_base_url": "https://dandelion-gigantic-challenge.ngrok-free.dev",
+    "crm_base_url": "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com",
     "crm_tenant_id": "6b4b6128-5b5f-4d2f-b5de-91511ab9b120",
+    "phone_number_id": "1208541249018781",
     "assistant_name": "Glaze Dental Clinic Assistant",
     "doctor": {
-        "name": "Dr. Shadab Mulla",
+        "name": "Dr SHADAB MULLA",
         "qualification": "B.D.S.",
-        "designation": "Dental Surgeon",
-        "experience": "20 years of experience"
+        "designation": "DENTAL SURGEON",
+        "experience": "20 years"
     },
     "languages": [
         "English",
@@ -84,31 +88,27 @@ DEFAULT_KNOWLEDGE = {
         "Hinglish"
     ],
     "location": {
-        "address": "Shop No 1, Monika 16, Pimpri Colony",
+        "address": "SHOP NO 1 MONIKA 16 PIMPRI COLONY",
         "maps": "https://maps.app.goo.gl/H6872MYf2gdthTZ7A?g_st=ac"
     },
     "contact": {
         "phone": "9822977740",
         "whatsapp": "9822977740"
     },
+    # EXACTLY TWO SERVICES CONFIGURED IN ONE PLACE
     "services": [
         {
-            "name": "RCT",
-            "description": "Root canal treatment."
+            "name": "Root Canal Treatment (RCT)",
+            "description": "Root canal treatment for tooth pain."
         },
         {
-            "name": "Cosmetic dentistry",
-            "description": "Cosmetic dental treatments."
-        },
-        {
-            "name": "Painless extractions",
-            "description": "Specialised in painless treatment."
+            "name": "Painless Extractions",
+            "description": "Specialised in painless dental treatment."
         }
     ],
     "clinic": {
-        "speciality": "Specialised in painless treatment",
-        "appointment_duration": "30 minutes",
-        "minimum_duration": "30 minutes"
+        "speciality": "Painless treatment",
+        "appointment_duration": "30 minutes"
     },
     "hours": {
         "days": [
@@ -119,8 +119,8 @@ DEFAULT_KNOWLEDGE = {
             "Friday",
             "Saturday"
         ],
-        "morning": "10:00 AM - 1:00 PM",
-        "evening": "6:00 PM - 9:00 PM"
+        "morning": "10 AM-1 PM",
+        "evening": "6 PM-9 PM"
     },
     "emergency": {
         "enabled": True,
@@ -148,8 +148,22 @@ def load_knowledge() -> Dict[str, Any]:
 KNOWLEDGE = load_knowledge()
 
 
+def get_configured_services() -> List[Dict[str, str]]:
+    """
+    Returns the exact configured services (EXACTLY TWO SERVICES).
+    """
+    raw_services = KNOWLEDGE.get("services", [])
+    result = []
+    for s in raw_services[:2]:
+        if isinstance(s, str):
+            result.append({"name": s, "description": s})
+        elif isinstance(s, dict):
+            result.append({"name": s.get("name", "Service"), "description": s.get("description", "")})
+    return result
+
+
 # ============================================================
-# DATABASE & CLIENT CONFIGURATION
+# DATABASE & PERSISTENCE
 # ============================================================
 
 def get_db():
@@ -162,16 +176,23 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
 
+    # 1. Client configuration table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS client_config (
             client_id TEXT PRIMARY KEY,
             client_name TEXT NOT NULL,
+            phone_number_id TEXT,
             crm_base_url TEXT NOT NULL,
             crm_tenant_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
 
+    _existing_cfg_cols = {row[1] for row in cursor.execute("PRAGMA table_info(client_config)")}
+    if "phone_number_id" not in _existing_cfg_cols:
+        cursor.execute("ALTER TABLE client_config ADD COLUMN phone_number_id TEXT")
+
+    # 2. Chats table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,18 +204,15 @@ def init_db():
         )
     """)
 
-    # Migrate chats table
-    _existing_chats_cols = {
-        row[1] for row in cursor.execute("PRAGMA table_info(chats)")
-    }
+    _existing_chats_cols = {row[1] for row in cursor.execute("PRAGMA table_info(chats)")}
     for _col, _def in [
         ("direction", "TEXT NOT NULL DEFAULT 'inbound'"),
         ("message_type", "TEXT"),
     ]:
         if _col not in _existing_chats_cols:
             cursor.execute(f"ALTER TABLE chats ADD COLUMN {_col} {_def}")
-            logger.info("Migrated chats table: added column %s", _col)
 
+    # 3. Actions table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,6 +222,7 @@ def init_db():
         )
     """)
 
+    # 4. Conversations table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             phone TEXT PRIMARY KEY,
@@ -218,10 +237,7 @@ def init_db():
         )
     """)
 
-    # Migrate existing conversations table — add columns that may be missing
-    _existing_conv_cols = {
-        row[1] for row in cursor.execute("PRAGMA table_info(conversations)")
-    }
+    _existing_conv_cols = {row[1] for row in cursor.execute("PRAGMA table_info(conversations)")}
     for _col, _def in [
         ("client_id", "TEXT NOT NULL DEFAULT 'glaze-dental'"),
         ("state", "TEXT NOT NULL DEFAULT 'IDLE'"),
@@ -233,8 +249,8 @@ def init_db():
     ]:
         if _col not in _existing_conv_cols:
             cursor.execute(f"ALTER TABLE conversations ADD COLUMN {_col} {_def}")
-            logger.info("Migrated conversations table: added column %s", _col)
 
+    # 5. Local Appointments table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -251,10 +267,7 @@ def init_db():
         )
     """)
 
-    # Migrate existing appointments table — add columns that may be missing
-    _existing_appt_cols = {
-        row[1] for row in cursor.execute("PRAGMA table_info(appointments)")
-    }
+    _existing_appt_cols = {row[1] for row in cursor.execute("PRAGMA table_info(appointments)")}
     for _col, _def in [
         ("client_id", "TEXT NOT NULL DEFAULT 'glaze-dental'"),
         ("crm_appointment_id", "TEXT"),
@@ -263,20 +276,45 @@ def init_db():
     ]:
         if _col not in _existing_appt_cols:
             cursor.execute(f"ALTER TABLE appointments ADD COLUMN {_col} {_def}")
-            logger.info("Migrated appointments table: added column %s", _col)
 
-    # Seed initial Glaze Dental client configuration if not already set
+    # 6. Idempotency table: processed_messages
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            msg_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # 7. Reminders table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            appointment_id INTEGER NOT NULL,
+            client_id TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            reminder_type TEXT NOT NULL DEFAULT '1h_before',
+            scheduled_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            sent_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(appointment_id, reminder_type)
+        )
+    """)
+
+    # Seed default Glaze Dental client config
     seed_client_id = KNOWLEDGE.get("client_id", "glaze-dental")
     seed_client_name = KNOWLEDGE.get("client_name", "Glaze Dental Clinic")
-    seed_crm_base_url = KNOWLEDGE.get("crm_base_url", "https://dandelion-gigantic-challenge.ngrok-free.dev").rstrip("/")
+    seed_crm_base_url = KNOWLEDGE.get("crm_base_url", "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com").rstrip("/")
     seed_crm_tenant_id = KNOWLEDGE.get("crm_tenant_id", "6b4b6128-5b5f-4d2f-b5de-91511ab9b120").strip()
+    seed_phone_number_id = KNOWLEDGE.get("phone_number_id", PHONE_NUMBER_ID)
 
     cursor.execute("SELECT client_id FROM client_config WHERE client_id = ?", (seed_client_id,))
     if not cursor.fetchone():
         cursor.execute("""
-            INSERT INTO client_config (client_id, client_name, crm_base_url, crm_tenant_id, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (seed_client_id, seed_client_name, seed_crm_base_url, seed_crm_tenant_id, datetime.datetime.utcnow().isoformat()))
+            INSERT INTO client_config (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (seed_client_id, seed_client_name, seed_phone_number_id, seed_crm_base_url, seed_crm_tenant_id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
         logger.info("Seeded initial CRM configuration for client: %s", seed_client_id)
 
     conn.commit()
@@ -293,13 +331,13 @@ def startup():
 
 
 # ============================================================
-# CLIENT CRM CONFIG HELPERS
+# CLIENT CONFIG RESOLUTION
 # ============================================================
 
 def get_client_crm_config(client_id: str) -> Optional[Dict[str, Any]]:
     conn = get_db()
     row = conn.execute(
-        "SELECT client_id, client_name, crm_base_url, crm_tenant_id, updated_at FROM client_config WHERE client_id = ?",
+        "SELECT client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at FROM client_config WHERE client_id = ?",
         (client_id,)
     ).fetchone()
     conn.close()
@@ -307,20 +345,44 @@ def get_client_crm_config(client_id: str) -> Optional[Dict[str, Any]]:
     if row:
         return dict(row)
 
-    # Fallback to seeded Glaze knowledge if matching
     if client_id == KNOWLEDGE.get("client_id", "glaze-dental"):
         return {
             "client_id": client_id,
             "client_name": KNOWLEDGE.get("client_name", "Glaze Dental Clinic"),
+            "phone_number_id": KNOWLEDGE.get("phone_number_id", PHONE_NUMBER_ID),
             "crm_base_url": KNOWLEDGE.get("crm_base_url", "").rstrip("/"),
             "crm_tenant_id": KNOWLEDGE.get("crm_tenant_id", "").strip(),
-            "updated_at": datetime.datetime.utcnow().isoformat()
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
 
     return None
 
 
-def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, crm_tenant_id: str) -> bool:
+def resolve_client_by_phone_number_id(receiving_phone_number_id: Optional[str]) -> str:
+    """
+    Identifies tenant client_id using the receiving Meta phone_number_id.
+    Patient cannot control or specify tenant ID or key.
+    """
+    if not receiving_phone_number_id:
+        return "glaze-dental"
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT client_id FROM client_config WHERE phone_number_id = ?",
+        (receiving_phone_number_id,)
+    ).fetchone()
+    conn.close()
+
+    if row and row["client_id"]:
+        return row["client_id"]
+
+    if receiving_phone_number_id == PHONE_NUMBER_ID:
+        return "glaze-dental"
+
+    return "glaze-dental"
+
+
+def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, crm_tenant_id: str, phone_number_id: Optional[str] = None) -> bool:
     parsed = urlparse(crm_base_url.strip())
     if not (parsed.scheme in ["http", "https"] and parsed.netloc):
         raise ValueError("crm_base_url must be a valid HTTP or HTTPS URL.")
@@ -330,76 +392,214 @@ def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, 
         raise ValueError("crm_tenant_id cannot be empty.")
 
     clean_base_url = crm_base_url.strip().rstrip("/")
+    phone_id = phone_number_id.strip() if phone_number_id else PHONE_NUMBER_ID
 
     conn = get_db()
     conn.execute("""
-        INSERT INTO client_config (client_id, client_name, crm_base_url, crm_tenant_id, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO client_config (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(client_id) DO UPDATE SET
             client_name = excluded.client_name,
+            phone_number_id = excluded.phone_number_id,
             crm_base_url = excluded.crm_base_url,
             crm_tenant_id = excluded.crm_tenant_id,
             updated_at = excluded.updated_at
-    """, (client_id.strip(), client_name.strip(), clean_base_url, crm_tenant_id, datetime.datetime.utcnow().isoformat()))
+    """, (client_id.strip(), client_name.strip(), phone_id, clean_base_url, crm_tenant_id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
     conn.commit()
     conn.close()
     return True
 
 
-def identify_client_for_sender(phone: str) -> str:
-    """
-    Resolves client_id for incoming WhatsApp sender.
-    Defaults to 'glaze-dental' for current practice.
-    """
+# ============================================================
+# IDEMPOTENCY HELPERS
+# ============================================================
+
+def is_message_processed(msg_id: str) -> bool:
+    if not msg_id:
+        return False
     conn = get_db()
-    row = conn.execute("SELECT client_id FROM conversations WHERE phone = ?", (phone,)).fetchone()
+    row = conn.execute("SELECT msg_id FROM processed_messages WHERE msg_id = ?", (msg_id,)).fetchone()
     conn.close()
-    if row and row["client_id"]:
-        return row["client_id"]
-    return "glaze-dental"
+    return row is not None
+
+
+def mark_message_processed(msg_id: str):
+    if not msg_id:
+        return
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_messages (msg_id, created_at) VALUES (?, ?)",
+            (msg_id, datetime.datetime.now(datetime.timezone.utc).isoformat())
+        )
+        conn.commit()
+    except Exception as exc:
+        logger.error("Failed to mark message processed | %s", exc)
+    finally:
+        conn.close()
 
 
 # ============================================================
-# CRM API INTEGRATION
+# CRM API CLIENT
 # ============================================================
 
-def crm_headers(crm_config: Dict[str, Any], is_post: bool = False) -> Dict[str, str]:
-    headers = {
-        "X-Tenant-Key": crm_config["crm_tenant_id"],
-        "ngrok-skip-browser-warning": "true"
-    }
-    if is_post:
-        headers["Content-Type"] = "application/json"
-    return headers
+class CRMClient:
+    @staticmethod
+    def headers(crm_config: Dict[str, Any], is_post: bool = False) -> Dict[str, str]:
+        hdrs = {
+            "X-Tenant-Key": crm_config["crm_tenant_id"],
+            "ngrok-skip-browser-warning": "true"
+        }
+        if is_post:
+            hdrs["Content-Type"] = "application/json"
+        return hdrs
+
+    @classmethod
+    def get_available_slots(cls, client_id: str, date_str: str) -> Optional[List[str]]:
+        crm_config = get_client_crm_config(client_id)
+        if not crm_config:
+            logger.error("CRM SLOTS ERROR | No CRM config found for client=%s", client_id)
+            return None
+
+        base_url = crm_config["crm_base_url"].rstrip("/")
+        url = f"{base_url}/api/v1/integrations/whatsapp/slots"
+        headers = cls.headers(crm_config, is_post=False)
+
+        try:
+            logger.info("CRM SLOTS REQUEST | client=%s | date=%s", client_id, date_str)
+            response = requests.get(url, params={"date": date_str}, headers=headers, timeout=15)
+            logger.info("CRM SLOTS | client=%s | date=%s | status=%d", client_id, date_str, response.status_code)
+
+            if response.status_code != 200:
+                logger.error("CRM SLOTS ERROR | status=%d | body=%s", response.status_code, response.text[:200])
+                return None
+
+            data = response.json()
+            return data.get("availableSlots", [])
+        except requests.RequestException as exc:
+            logger.error("CRM SLOTS REQUEST ERROR | %s", repr(exc))
+            return None
+        except Exception as exc:
+            logger.error("CRM SLOTS ERROR | %s", repr(exc))
+            return None
+
+    @classmethod
+    def book_appointment(
+        cls,
+        client_id: str,
+        customer_name: str,
+        customer_phone: str,
+        booking_date: str,
+        booking_time: str,
+        age: str = "",
+        place: str = ""
+    ) -> Dict[str, Any]:
+        crm_config = get_client_crm_config(client_id)
+        if not crm_config:
+            logger.error("CRM BOOKING ERROR | No CRM config found for client=%s", client_id)
+            return {"status": "error", "data": {}}
+
+        base_url = crm_config["crm_base_url"].rstrip("/")
+        url = f"{base_url}/api/v1/integrations/whatsapp/appointments/book"
+        headers = cls.headers(crm_config, is_post=True)
+
+        payload = {
+            "customerName": customer_name,
+            "customerPhone": customer_phone,
+            "bookingDate": booking_date,
+            "bookingTime": booking_time,
+            "title": "WhatsApp Consultation",
+            "age": age,
+            "place": place
+        }
+
+        try:
+            logger.info("CRM BOOKING REQUEST | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
+            logger.info(
+                "CRM BOOKING | client=%s | date=%s | time=%s | status=%d",
+                client_id, booking_date, booking_time, response.status_code
+            )
+
+            if response.status_code == 201:
+                logger.info("CRM BOOKING SUCCESS | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
+                return {"status": "success", "data": response.json() if response.text else {}}
+
+            if response.status_code == 409:
+                logger.warning("CRM BOOKING CONFLICT | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
+                return {"status": "conflict", "data": response.json() if response.text else {}}
+
+            logger.error("CRM BOOKING ERROR | status=%d | body=%s", response.status_code, response.text[:200])
+            return {"status": "error", "data": response.json() if response.text else {}}
+        except requests.RequestException as exc:
+            logger.error("CRM BOOKING REQUEST ERROR | %s", repr(exc))
+            return {"status": "error", "data": {}}
+        except Exception as exc:
+            logger.error("CRM BOOKING ERROR | %s", repr(exc))
+            return {"status": "error", "data": {}}
+
+    @classmethod
+    def cancel_appointment(cls, client_id: str, appointment_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Cancel endpoint interface.
+        Note: Cancel endpoint exists on CRM, but exact request payload structure requires confirmation from CRM developer.
+        """
+        crm_config = get_client_crm_config(client_id)
+        if not crm_config:
+            logger.error("CRM CANCEL ERROR | No CRM config found for client=%s", client_id)
+            return {"status": "error", "message": "No CRM config found", "status_code": 404}
+
+        base_url = crm_config["crm_base_url"].rstrip("/")
+        url = f"{base_url}/api/v1/integrations/whatsapp/appointments/cancel"
+        headers = cls.headers(crm_config, is_post=True)
+
+        try:
+            logger.info("CRM CANCEL REQUEST | client=%s | data=%s", client_id, appointment_data)
+            response = requests.post(url, headers=headers, json=appointment_data, timeout=20)
+            logger.info("CRM CANCEL RESPONSE | client=%s | status=%d", client_id, response.status_code)
+
+            if response.status_code in [200, 204]:
+                return {"status": "success", "data": response.json() if response.text else {}, "status_code": response.status_code}
+            return {"status": "error", "data": response.json() if response.text else {}, "status_code": response.status_code}
+        except requests.RequestException as exc:
+            logger.error("CRM CANCEL REQUEST ERROR | %s", repr(exc))
+            return {"status": "error", "message": str(exc), "status_code": 500}
+        except Exception as exc:
+            logger.error("CRM CANCEL ERROR | %s", repr(exc))
+            return {"status": "error", "message": str(exc), "status_code": 500}
+
+    @classmethod
+    def get_appointments(cls, client_id: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Retrieves appointment records from CRM for the dashboard proxy.
+        """
+        crm_config = get_client_crm_config(client_id)
+        if not crm_config:
+            logger.error("CRM GET APPOINTMENTS ERROR | No CRM config found for client=%s", client_id)
+            return {"status": "error", "message": "No CRM config found", "status_code": 404}
+
+        base_url = crm_config["crm_base_url"].rstrip("/")
+        url = f"{base_url}/api/v1/integrations/whatsapp/appointments"
+        headers = cls.headers(crm_config, is_post=False)
+
+        try:
+            logger.info("CRM GET APPOINTMENTS REQUEST | client=%s", client_id)
+            response = requests.get(url, params=filters or {}, headers=headers, timeout=15)
+            logger.info("CRM GET APPOINTMENTS | client=%s | status=%d", client_id, response.status_code)
+
+            if response.status_code == 200:
+                return {"status": "success", "data": response.json() if response.text else [], "status_code": 200}
+            return {"status": "error", "message": f"CRM returned status {response.status_code}", "status_code": response.status_code}
+        except requests.RequestException as exc:
+            logger.error("CRM GET APPOINTMENTS REQUEST ERROR | %s", repr(exc))
+            return {"status": "error", "message": str(exc), "status_code": 500}
+        except Exception as exc:
+            logger.error("CRM GET APPOINTMENTS ERROR | %s", repr(exc))
+            return {"status": "error", "message": str(exc), "status_code": 500}
 
 
 def get_available_slots(client_id: str, date_str: str) -> Optional[List[str]]:
-    crm_config = get_client_crm_config(client_id)
-    if not crm_config:
-        logger.error("CRM SLOTS ERROR | No CRM config found for client=%s", client_id)
-        return None
-
-    base_url = crm_config["crm_base_url"].rstrip("/")
-    url = f"{base_url}/api/v1/integrations/whatsapp/slots"
-    headers = crm_headers(crm_config, is_post=False)
-
-    try:
-        logger.info("CRM SLOTS REQUEST | client=%s | date=%s", client_id, date_str)
-        response = requests.get(url, params={"date": date_str}, headers=headers, timeout=15)
-        logger.info("CRM SLOTS | client=%s | date=%s | status=%d", client_id, date_str, response.status_code)
-
-        if response.status_code != 200:
-            logger.error("CRM SLOTS ERROR | status=%d | body=%s", response.status_code, response.text[:200])
-            return None
-
-        data = response.json()
-        return data.get("availableSlots", [])
-    except requests.RequestException as exc:
-        logger.error("CRM SLOTS REQUEST ERROR | %s", repr(exc))
-        return None
-    except Exception as exc:
-        logger.error("CRM SLOTS ERROR | %s", repr(exc))
-        return None
+    return CRMClient.get_available_slots(client_id, date_str)
 
 
 def book_appointment(
@@ -411,57 +611,170 @@ def book_appointment(
     age: str = "",
     place: str = ""
 ) -> Dict[str, Any]:
-    crm_config = get_client_crm_config(client_id)
-    if not crm_config:
-        logger.error("CRM BOOKING ERROR | No CRM config found for client=%s", client_id)
-        return {"status": "error", "data": {}}
+    return CRMClient.book_appointment(
+        client_id=client_id,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        booking_date=booking_date,
+        booking_time=booking_time,
+        age=age,
+        place=place
+    )
 
-    base_url = crm_config["crm_base_url"].rstrip("/")
-    url = f"{base_url}/api/v1/integrations/whatsapp/appointments/book"
-    headers = crm_headers(crm_config, is_post=True)
 
-    payload = {
-        "customerName": customer_name,
-        "customerPhone": customer_phone,
-        "bookingDate": booking_date,
-        "bookingTime": booking_time,
-        "title": "WhatsApp Consultation",
-        "age": age,
-        "place": place
-    }
+def cancel_appointment(client_id: str, appointment_data: Dict[str, Any]) -> Dict[str, Any]:
+    return CRMClient.cancel_appointment(client_id, appointment_data)
 
-    try:
-        logger.info("CRM BOOKING REQUEST | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        logger.info(
-            "CRM BOOKING | client=%s | date=%s | time=%s | status=%d",
-            client_id, booking_date, booking_time, response.status_code
-        )
 
-        if response.status_code == 201:
-            logger.info("CRM BOOKING SUCCESS | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
-            return {"status": "success", "data": response.json()}
+def get_appointments(client_id: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return CRMClient.get_appointments(client_id, filters)
 
-        if response.status_code == 409:
-            logger.warning("CRM BOOKING CONFLICT | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
-            return {"status": "conflict", "data": response.json()}
 
-        logger.error("CRM BOOKING ERROR | status=%d | body=%s", response.status_code, response.text[:200])
-        return {"status": "error", "data": response.json() if response.text else {}}
-    except requests.RequestException as exc:
-        logger.error("CRM BOOKING REQUEST ERROR | %s", repr(exc))
-        return {"status": "error", "data": {}}
-    except Exception as exc:
-        logger.error("CRM BOOKING ERROR | %s", repr(exc))
-        return {"status": "error", "data": {}}
 
 
 # ============================================================
-# HELPERS & PERSISTENCE
+# WHATSAPP PROVIDER LAYER
+# ============================================================
+
+class MetaCloudProvider:
+    @staticmethod
+    def _send_payload(payload: Dict[str, Any]) -> bool:
+        if not WHATSAPP_TOKEN:
+            logger.error("META_WHATSAPP_TOKEN is missing")
+            return False
+
+        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+        try:
+            logger.info("WHATSAPP OUTBOUND | URL=%s | TO=%s", url, payload.get("to"))
+            response = requests.post(url, headers=headers, json=payload, timeout=15)
+            logger.info("WHATSAPP RESPONSE | STATUS=%s | BODY=%s", response.status_code, response.text[:500])
+            response.raise_for_status()
+            return True
+        except requests.exceptions.RequestException as exc:
+            logger.error("WHATSAPP SEND ERROR | %s: %s", type(exc).__name__, exc)
+            return False
+
+    @classmethod
+    def send_text(cls, phone: str, text: str) -> bool:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "text",
+            "text": {"preview_url": False, "body": text}
+        }
+        success = _send_payload(payload)
+        if success:
+            log_chat(phone, "outgoing", text, "text")
+        return success
+
+    @classmethod
+    def send_button(cls, phone: str, body: str, buttons: List[Dict[str, str]]) -> bool:
+        buttons = buttons[:3]
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": body},
+                "action": {
+                    "buttons": [
+                        {
+                            "type": "reply",
+                            "reply": {"id": b["id"][:256], "title": b["title"][:20]}
+                        }
+                        for b in buttons
+                    ]
+                }
+            }
+        }
+        success = _send_payload(payload)
+        if success:
+            log_chat(phone, "outgoing", body, "interactive_button")
+        return success
+
+    @classmethod
+    def send_list(cls, phone: str, body: str, button_text: str, rows: List[Dict[str, str]]) -> bool:
+        rows = rows[:10]
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": {"text": body},
+                "action": {
+                    "button": button_text[:20],
+                    "sections": [
+                        {
+                            "title": "Options",
+                            "rows": [
+                                {
+                                    "id": r["id"][:200],
+                                    "title": r["title"][:24],
+                                    "description": r.get("description", "")[:72]
+                                }
+                                for r in rows
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+        success = _send_payload(payload)
+        if success:
+            log_chat(phone, "outgoing", body, "interactive_list")
+        return success
+
+    @classmethod
+    def send_template(cls, phone: str, template_name: str, language_code: str = "en", components: List[Any] = None) -> bool:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language_code},
+                "components": components or []
+            }
+        }
+        success = _send_payload(payload)
+        if success:
+            log_chat(phone, "outgoing", f"[Template: {template_name}]", "template")
+        return success
+
+
+def _send_payload(payload: Dict[str, Any]) -> bool:
+    return MetaCloudProvider._send_payload(payload)
+
+
+def send_text_message(phone: str, text: str) -> bool:
+    return MetaCloudProvider.send_text(phone, text)
+
+
+def send_button_message(phone: str, body: str, buttons: List[Dict[str, str]]) -> bool:
+    return MetaCloudProvider.send_button(phone, body, buttons)
+
+
+def send_list_message(phone: str, body: str, button_text: str, rows: List[Dict[str, str]]) -> bool:
+    return MetaCloudProvider.send_list(phone, body, button_text, rows)
+
+
+def send_template_message(phone: str, template_name: str, language_code: str = "en", components: List[Any] = None) -> bool:
+    return MetaCloudProvider.send_template(phone, template_name, language_code, components)
+
+
+# ============================================================
+# CONVERSATION STATE & CHAT LOGS
 # ============================================================
 
 def now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def clinic_name() -> str:
@@ -569,117 +882,161 @@ def save_appointment_record(
     appointment_date: str,
     appointment_time: str,
     crm_appointment_id: Optional[str] = None
-):
+) -> int:
     conn = get_db()
-    conn.execute("""
+    cursor = conn.cursor()
+    cursor.execute("""
         INSERT INTO appointments
         (phone, client_id, crm_appointment_id, service, patient_name, patient_type, appointment_date, appointment_time, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
     """, (phone, client_id, crm_appointment_id, service, patient_name, patient_type, appointment_date, appointment_time, now_iso()))
+    appt_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    return appt_id
 
 
 # ============================================================
-# META WHATSAPP CLOUD API
+# APPOINTMENT REMINDER WORKER (1-HOUR BEFORE REMINDER)
 # ============================================================
 
-def _send_payload(payload: Dict[str, Any]) -> bool:
-    if not WHATSAPP_TOKEN:
-        logger.error("META_WHATSAPP_TOKEN is missing")
-        return False
-
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
+def parse_appointment_scheduled_dt(date_str: str, time_str: str) -> Optional[datetime.datetime]:
+    """
+    Parses date (YYYY-MM-DD) and time (e.g. "12:00 PM" or "06:00 PM") in Asia/Kolkata timezone.
+    """
     try:
-        logger.info("WHATSAPP OUTBOUND | URL=%s | TO=%s", url, payload.get("to"))
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        logger.info("WHATSAPP RESPONSE | STATUS=%s | BODY=%s", response.status_code, response.text[:500])
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as exc:
-        logger.error("WHATSAPP SEND ERROR | %s: %s", type(exc).__name__, exc)
+        clean_time = time_str.strip().upper()
+        dt_str = f"{date_str} {clean_time}"
+        parsed = datetime.datetime.strptime(dt_str, "%Y-%m-%d %I:%M %p")
+        return parsed.replace(tzinfo=TIMEZONE_KOLKATA)
+    except ValueError:
+        try:
+            parsed = datetime.datetime.strptime(f"{date_str} {time_str.strip()}", "%Y-%m-%d %H:%M")
+            return parsed.replace(tzinfo=TIMEZONE_KOLKATA)
+        except Exception:
+            return None
+
+
+def schedule_appointment_reminder(
+    appointment_id: int,
+    client_id: str,
+    phone: str,
+    appointment_date: str,
+    appointment_time: str
+) -> bool:
+    appt_dt = parse_appointment_scheduled_dt(appointment_date, appointment_time)
+    if not appt_dt:
+        logger.error("Cannot parse appointment datetime for reminder | date=%s time=%s", appointment_date, appointment_time)
         return False
 
+    # 1-hour before appointment reminder
+    reminder_dt = appt_dt - datetime.timedelta(hours=1)
+    reminder_iso = reminder_dt.isoformat()
 
-def send_text_message(phone: str, text: str) -> bool:
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"preview_url": False, "body": text}
-    }
-    success = _send_payload(payload)
-    if success:
-        log_chat(phone, "outgoing", text, "text")
-    return success
-
-
-def send_button_message(phone: str, body: str, buttons: List[Dict[str, str]]) -> bool:
-    buttons = buttons[:3]
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": body},
-            "action": {
-                "buttons": [
-                    {
-                        "type": "reply",
-                        "reply": {"id": b["id"][:256], "title": b["title"][:20]}
-                    }
-                    for b in buttons
-                ]
-            }
-        }
-    }
-    success = _send_payload(payload)
-    if success:
-        log_chat(phone, "outgoing", body, "interactive_button")
-    return success
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO reminders
+            (appointment_id, client_id, phone, reminder_type, scheduled_at, status, attempts, created_at)
+            VALUES (?, ?, ?, '1h_before', ?, 'pending', 0, ?)
+        """, (appointment_id, client_id, phone, reminder_iso, now_iso()))
+        conn.commit()
+        logger.info("Scheduled 1h appointment reminder | appt_id=%d scheduled_at=%s", appointment_id, reminder_iso)
+        return True
+    except Exception as exc:
+        logger.error("Failed to schedule reminder | %s", exc)
+        return False
+    finally:
+        conn.close()
 
 
-def send_list_message(phone: str, body: str, button_text: str, rows: List[Dict[str, str]]) -> bool:
-    rows = rows[:10]
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "interactive",
-        "interactive": {
-            "type": "list",
-            "body": {"text": body},
-            "action": {
-                "button": button_text[:20],
-                "sections": [
-                    {
-                        "title": "Options",
-                        "rows": [
-                            {
-                                "id": r["id"][:200],
-                                "title": r["title"][:24],
-                                "description": r.get("description", "")[:72]
-                            }
-                            for r in rows
-                        ]
-                    }
-                ]
-            }
-        }
-    }
-    success = _send_payload(payload)
-    if success:
-        log_chat(phone, "outgoing", body, "interactive_list")
-    return success
+def process_due_reminders() -> int:
+    """
+    Background worker process checking due pending reminders.
+    Sends Meta WhatsApp template (or fallback message).
+    Prevents duplicate sends and retries transient failures.
+    """
+    now_dt = datetime.datetime.now(TIMEZONE_KOLKATA)
+    now_iso_str = now_dt.isoformat()
+
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT id, appointment_id, client_id, phone, reminder_type, scheduled_at, attempts
+        FROM reminders
+        WHERE status = 'pending' AND scheduled_at <= ? AND attempts < 3
+    """, (now_iso_str,)).fetchall()
+    conn.close()
+
+    sent_count = 0
+    for r in rows:
+        reminder_id = r["id"]
+        phone = r["phone"]
+        client_id = r["client_id"]
+        attempts = r["attempts"] + 1
+        scheduled_at_str = r["scheduled_at"]
+
+        # Atomic claim: update status to 'sending'
+        conn_claim = get_db()
+        cursor = conn_claim.cursor()
+        cursor.execute("UPDATE reminders SET status = 'sending', attempts = ? WHERE id = ? AND status = 'pending'", (attempts, reminder_id))
+        claimed = cursor.rowcount > 0
+        conn_claim.commit()
+        conn_claim.close()
+
+        if not claimed:
+            continue
+
+        # Check for stale reminders (> 2 hours past scheduled time)
+        try:
+            sched_dt = datetime.datetime.fromisoformat(scheduled_at_str)
+            if (now_dt - sched_dt).total_seconds() > 7200:
+                logger.warning("Skipping stale reminder id=%d scheduled_at=%s", reminder_id, scheduled_at_str)
+                conn_stale = get_db()
+                conn_stale.execute("UPDATE reminders SET status = 'stale' WHERE id = ?", (reminder_id,))
+                conn_stale.commit()
+                conn_stale.close()
+                continue
+        except Exception:
+            pass
+
+        # Send reminder via WhatsApp template (or fallback text)
+        msg_text = (
+            f"⏰ Reminder: You have an upcoming appointment at {clinic_name()} in 1 hour. "
+            "Please reach the clinic on time. Call 9822977740 if you need directions."
+        )
+
+        template_sent = send_template_message(
+            phone=phone,
+            template_name=REMINDER_TEMPLATE_NAME,
+            language_code="en",
+            components=[
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": clinic_name()}]
+                }
+            ]
+        )
+
+        # Fallback to direct text message if template failed or in test environment
+        success = template_sent or send_text_message(phone, msg_text)
+
+        conn_fin = get_db()
+        if success:
+            conn_fin.execute("UPDATE reminders SET status = 'sent', sent_at = ? WHERE id = ?", (now_iso(), reminder_id))
+            sent_count += 1
+            logger.info("SUCCESSFULLY SENT REMINDER | id=%d | phone=%s", reminder_id, phone)
+        else:
+            new_status = 'failed' if attempts >= 3 else 'pending'
+            conn_fin.execute("UPDATE reminders SET status = ? WHERE id = ?", (new_status, reminder_id))
+            logger.warning("FAILED TO SEND REMINDER | id=%d | attempts=%d | status=%s", reminder_id, attempts, new_status)
+        conn_fin.commit()
+        conn_fin.close()
+
+    return sent_count
 
 
 # ============================================================
-# UI MENUS
+# UI & MESSAGES
 # ============================================================
 
 def main_menu(phone: str) -> bool:
@@ -693,12 +1050,10 @@ def main_menu(phone: str) -> bool:
 
 
 def send_services(phone: str) -> bool:
-    services = KNOWLEDGE.get("services", [])
+    services = get_configured_services()
     rows = []
-    for i, s in enumerate(services[:10]):
-        name = s if isinstance(s, str) else s.get("name", f"Service {i+1}")
-        desc = "" if isinstance(s, str) else s.get("description", "")
-        rows.append({"id": f"service_{i}", "title": name[:24], "description": desc[:72]})
+    for i, s in enumerate(services):
+        rows.append({"id": f"service_{i}", "title": s["name"][:24], "description": s["description"][:72]})
 
     return send_list_message(phone, f"Here are the services available at {clinic_name()}:", "View services", rows)
 
@@ -711,26 +1066,24 @@ def send_clinic_info(phone: str) -> bool:
 
     text = (
         f"📍 *{clinic_name()}*\n\n"
-        f"👨‍⚕️ {doctor.get('name', 'Dr. Shadab Mulla')}\n"
-        f"{doctor.get('qualification', 'B.D.S.')} · {doctor.get('designation', 'Dental Surgeon')}\n"
-        f"{doctor.get('experience', '20 years of experience')}\n\n"
-        f"📍 {location.get('address', 'Shop No 1, Monika 16, Pimpri Colony')}\n"
+        f"👨‍⚕️ {doctor.get('name', 'Dr SHADAB MULLA')}\n"
+        f"{doctor.get('qualification', 'B.D.S.')} · {doctor.get('designation', 'DENTAL SURGEON')}\n"
+        f"{doctor.get('experience', '20 years')}\n\n"
+        f"📍 {location.get('address', 'SHOP NO 1 MONIKA 16 PIMPRI COLONY')}\n"
         f"🗺️ {location.get('maps', '')}\n\n"
         f"📞 Phone: {contact.get('phone', '9822977740')}\n\n"
         f"🕒 Monday–Saturday\n"
-        f"• {hours.get('morning', '10:00 AM - 1:00 PM')}\n"
-        f"• {hours.get('evening', '6:00 PM - 9:00 PM')}"
+        f"• {hours.get('morning', '10 AM-1 PM')}\n"
+        f"• {hours.get('evening', '6 PM-9 PM')}"
     )
     return send_text_message(phone, text)
 
 
 def send_booking_services(phone: str) -> bool:
-    services = KNOWLEDGE.get("services", [])
+    services = get_configured_services()
     rows = []
-    for i, s in enumerate(services[:10]):
-        name = s if isinstance(s, str) else s.get("name", f"Service {i+1}")
-        desc = "" if isinstance(s, str) else s.get("description", "")
-        rows.append({"id": f"booking_service_{i}", "title": name[:24], "description": desc[:72]})
+    for i, s in enumerate(services):
+        rows.append({"id": f"booking_service_{i}", "title": s["name"][:24], "description": s["description"][:72]})
 
     return send_list_message(phone, "What treatment would you like to book?", "Choose service", rows)
 
@@ -746,7 +1099,7 @@ def send_patient_type_options(phone: str) -> bool:
 def send_date_options(phone: str) -> bool:
     today = datetime.date.today()
     tomorrow = today + datetime.timedelta(days=1)
-    body = "When would you like your appointment?"
+    body = "When would you like your appointment? (Working days: Monday to Saturday)"
     buttons = [
         {"id": f"date_{today.isoformat()}", "title": "Today"},
         {"id": f"date_{tomorrow.isoformat()}", "title": "Tomorrow"},
@@ -768,8 +1121,6 @@ def parse_date_input(text: str) -> Optional[str]:
     for fmt in formats:
         try:
             parsed = datetime.datetime.strptime(text, fmt).date()
-            if parsed < today:
-                return None
             return parsed.isoformat()
         except ValueError:
             continue
@@ -805,10 +1156,10 @@ You are the customer support assistant for {clinic_name()}.
 Answer the customer's question using ONLY the verified information in the knowledge base below.
 
 CRITICAL RULES:
-- Do not invent prices, consultation fees, discounts, or treatment costs.
-- Do not invent doctors, branches, insurance, or medical guarantees.
+- Do NOT invent prices, consultation fees, discounts, or treatment costs.
+- Do NOT invent doctors, branches, insurance, or medical guarantees.
 - If asked about prices or fees, clearly state that pricing details are not listed and recommend calling {clinic_name()} at 9822977740.
-- If the answer is not available in the knowledge base, politely explain that you do not have that information and suggest contacting the clinic.
+- If the answer is not available in the knowledge base, politely explain that you do not have that information and suggest contacting the clinic at 9822977740.
 - Keep the answer short (1-3 sentences), reassuring, and natural for WhatsApp.
 
 Knowledge base:
@@ -832,7 +1183,7 @@ Customer question:
 
 
 # ============================================================
-# MESSAGE HANDLER & DETERMINISTIC STATE MACHINE
+# DETERMINISTIC BOOKING STATE MACHINE
 # ============================================================
 
 def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optional[str] = None):
@@ -851,9 +1202,10 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         log_action(phone, action_id)
 
     # --------------------------------------------------------
-    # 1. EMERGENCY CHECK (Priority: Before normal booking routing)
+    # 1. EMERGENCY CHECK (Highest Priority)
     # --------------------------------------------------------
     if is_emergency(text):
+        reset_conversation(phone)
         emergency_msg = (
             "🚨 This may require urgent attention. Please call Glaze Dental Clinic at 9822977740 "
             "immediately for emergency assistance."
@@ -879,7 +1231,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         return main_menu(phone)
 
     # --------------------------------------------------------
-    # 4. PRICING INQUIRIES
+    # 4. PRICING INQUIRIES (SAFETY CHECK)
     # --------------------------------------------------------
     if is_pricing_question(text) and current_state == "IDLE":
         price_msg = "Pricing details are not listed. Please contact Glaze Dental Clinic at 9822977740 for treatment charges."
@@ -890,7 +1242,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     # 5. IDLE STATE
     # --------------------------------------------------------
     if current_state == "IDLE":
-        if action_id in {"book_appointment", "btn_book"}:
+        if action_id in {"book_appointment", "btn_book"} or "book" in normalized or "appointment" in normalized:
             update_conversation(phone, state="BOOKING_SERVICE")
             return send_booking_services(phone)
 
@@ -913,21 +1265,20 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     # --------------------------------------------------------
     if current_state == "BOOKING_SERVICE":
         service = None
-        services = KNOWLEDGE.get("services", [])
+        services = get_configured_services()
 
         if action_id and action_id.startswith("booking_service_"):
             try:
                 idx = int(action_id.replace("booking_service_", ""))
                 if 0 <= idx < len(services):
-                    item = services[idx]
-                    service = item if isinstance(item, str) else item.get("name")
+                    service = services[idx]["name"]
             except (ValueError, IndexError):
                 service = None
 
         if not service:
-            for item in services:
-                name = item if isinstance(item, str) else item.get("name", "")
-                if name.lower() == normalized or normalized in name.lower():
+            for s in services:
+                name = s["name"]
+                if name.lower() in normalized or normalized in name.lower():
                     service = name
                     break
 
@@ -986,6 +1337,22 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             send_text_message(phone, "I couldn't recognize that date. Please use YYYY-MM-DD (e.g., 2026-09-20) or choose Today/Tomorrow:")
             return send_date_options(phone)
 
+        # Date Validation: Past Date & Sunday
+        try:
+            parsed_dt = datetime.datetime.strptime(appointment_date, "%Y-%m-%d").date()
+            today_dt = datetime.date.today()
+
+            if parsed_dt < today_dt:
+                send_text_message(phone, "Appointments cannot be booked for past dates. Please choose an upcoming date (Monday to Saturday):")
+                return send_date_options(phone)
+
+            if parsed_dt.weekday() == 6:  # Sunday
+                send_text_message(phone, "Glaze Dental Clinic is closed on Sundays. Please choose a date from Monday to Saturday:")
+                return send_date_options(phone)
+        except ValueError:
+            send_text_message(phone, "Invalid date format. Please use YYYY-MM-DD:")
+            return send_date_options(phone)
+
         # Query CRM for live available slots
         available_slots = get_available_slots(client_id, appointment_date)
 
@@ -1018,10 +1385,8 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
 
         selected_time = None
         if action_id and action_id.startswith("time_"):
-            # Trust the action_id directly — it was built from our own CRM slot list
             selected_time = action_id[len("time_"):]
         else:
-            # Text-based fallback: re-query CRM to validate the typed time
             available_slots = get_available_slots(client_id, appointment_date) if appointment_date else None
             if available_slots is None:
                 send_text_message(
@@ -1042,7 +1407,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
 
         update_conversation(phone, state="BOOKING_CONFIRMATION", appointment_time=selected_time)
 
-        service_val = conversation.get("service", "Dental consultation")
+        service_val = conversation.get("service", "Dental Consultation")
         name_val = conversation.get("patient_name", "Patient")
         ptype_val = conversation.get("patient_type", "New")
 
@@ -1087,7 +1452,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             if status == "success":
                 # 201 Created
                 crm_apt_id = data.get("appointmentId") or data.get("id") or data.get("appointment", {}).get("id")
-                save_appointment_record(
+                local_apt_id = save_appointment_record(
                     phone=phone,
                     client_id=client_id,
                     service=c_service,
@@ -1097,23 +1462,36 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                     appointment_time=c_time,
                     crm_appointment_id=crm_apt_id
                 )
+
+                # Schedule 1-hour appointment reminder
+                schedule_appointment_reminder(
+                    appointment_id=local_apt_id,
+                    client_id=client_id,
+                    phone=phone,
+                    appointment_date=c_date,
+                    appointment_time=c_time
+                )
+
+                # Reset state & Send confirmation
                 reset_conversation(phone)
 
                 confirmation_msg = (
                     f"✅ Your appointment has been confirmed at {clinic_name()}.\n\n"
+                    f"Name: {c_name}\n"
                     f"Date: {c_date}\n"
                     f"Time: {c_time}\n"
                     f"Service: {c_service}\n\n"
                     "Thank you!"
                 )
                 send_text_message(phone, confirmation_msg)
-                return main_menu(phone)
+                # CRITICAL: STOP HERE. DO NOT SEND WELCOME MENU AGAIN.
+                return
 
             elif status == "conflict":
-                # 409 Conflict: Slot was booked by someone else
+                # 409 Conflict: Slot booked by someone else
                 send_text_message(
                     phone,
-                    "Sorry, that time slot is already booked. Please choose another available time."
+                    "Sorry, that time slot is already booked by someone else. Please choose another available time."
                 )
                 fresh_slots = get_available_slots(client_id, c_date)
                 if fresh_slots:
@@ -1127,12 +1505,13 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
 
             else:
                 # Other CRM failure
+                reset_conversation(phone)
                 send_text_message(
                     phone,
                     "I couldn't confirm the appointment right now. "
                     "Please try again shortly or call Glaze Dental Clinic at 9822977740."
                 )
-                return main_menu(phone)
+                return
 
         elif action_id in {"cancel_booking", "btn_cancel"} or normalized in {"cancel", "no"}:
             reset_conversation(phone)
@@ -1156,7 +1535,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
 
 
 # ============================================================
-# META WEBHOOK VERIFICATION & RECEIVER
+# META WEBHOOK ENDPOINTS & IDEMPOTENCY
 # ============================================================
 
 @app.get("/webhook")
@@ -1169,7 +1548,7 @@ async def verify_webhook(
         logger.info("WEBHOOK VERIFICATION SUCCESS")
         return PlainTextResponse(hub_challenge or "")
 
-    logger.warning("WEBHOOK VERIFICATION FAILED")
+    logger.warning("WEBHOOK VERIFICATION FAILED | token=%s", hub_verify_token)
     return PlainTextResponse("Forbidden", status_code=403)
 
 
@@ -1194,6 +1573,7 @@ async def whatsapp_webhook(request: Request):
         return JSONResponse({"status": "ignored", "reason": "invalid_object"})
 
     processed = 0
+    ignored_duplicates = 0
     entries = body.get("entry", [])
 
     for entry in entries:
@@ -1201,11 +1581,32 @@ async def whatsapp_webhook(request: Request):
             value = change.get("value", {})
             messages = value.get("messages", [])
 
+            # Extract receiving phone_number_id from Meta metadata
+            meta_info = value.get("metadata", {})
+            receiving_phone_number_id = meta_info.get("phone_number_id")
+
+            # Resolve tenant client_id strictly from Meta connection (NOT from patient payload)
+            resolved_client_id = resolve_client_by_phone_number_id(receiving_phone_number_id)
+
             for message in messages:
+                msg_id = message.get("id")
                 sender = message.get("from")
                 msg_type = message.get("type", "unknown")
+
                 if not sender:
                     continue
+
+                # IDEMPOTENCY DEDUPLICATION CHECK
+                if msg_id and is_message_processed(msg_id):
+                    logger.info("DUPLICATE WEBHOOK IGNORED | msg_id=%s | sender=%s", msg_id, sender)
+                    ignored_duplicates += 1
+                    continue
+
+                if msg_id:
+                    mark_message_processed(msg_id)
+
+                # Ensure conversation client_id is aligned to resolved tenant
+                update_conversation(sender, client_id=resolved_client_id)
 
                 text_content = ""
                 action_id = None
@@ -1223,6 +1624,12 @@ async def whatsapp_webhook(request: Request):
                         litem = interactive.get("list_reply", {})
                         action_id = litem.get("id")
                         text_content = litem.get("title", "").strip()
+                else:
+                    # Gracefully handle unsupported message types (e.g. image, audio, sticker)
+                    logger.info("UNSUPPORTED MESSAGE TYPE | sender=%s | type=%s", sender, msg_type)
+                    send_text_message(sender, "Thank you for reaching out! I can assist with text messages for booking appointments, services, and clinic details.")
+                    processed += 1
+                    continue
 
                 if not text_content and not action_id:
                     continue
@@ -1238,15 +1645,15 @@ async def whatsapp_webhook(request: Request):
                 except Exception as exc:
                     logger.error("MESSAGE HANDLER ERROR | USER=%s | %s: %s", sender, type(exc).__name__, exc, exc_info=True)
                     try:
-                        send_text_message(sender, "Sorry, something went wrong. Please try again.")
+                        send_text_message(sender, "Sorry, something went wrong. Please try again or call 9822977740.")
                     except Exception:
                         pass
 
-    return JSONResponse({"status": "ok", "processed": processed}, status_code=200)
+    return JSONResponse({"status": "ok", "processed": processed, "ignored_duplicates": ignored_duplicates}, status_code=200)
 
 
 # ============================================================
-# HEALTH & DASHBOARD / PORTAL ENDPOINTS
+# HEALTH, DASHBOARD & MANAGEMENT ENDPOINTS
 # ============================================================
 
 @app.get("/")
@@ -1256,6 +1663,22 @@ async def root():
         "service": "Glaze Dental Clinic WhatsApp AI",
         "webhook": "/webhook",
         "graph_api_version": GRAPH_API_VERSION
+    }
+
+
+@app.get("/health")
+async def health_check():
+    conn = get_db()
+    pending_reminders = conn.execute("SELECT COUNT(*) FROM reminders WHERE status = 'pending'").fetchone()[0]
+    processed_count = conn.execute("SELECT COUNT(*) FROM processed_messages").fetchone()[0]
+    conn.close()
+
+    return {
+        "status": "ok",
+        "database": "connected",
+        "service": "Glaze Dental Clinic WhatsApp AI",
+        "pending_reminders": pending_reminders,
+        "processed_messages_count": processed_count
     }
 
 
@@ -1303,7 +1726,7 @@ async def dashboard_portal(client_id: str = "glaze-dental"):
         </div>
         <div class="form-group">
             <label>CRM API Base URL</label>
-            <input type="text" id="crmBaseUrl" value="{config['crm_base_url']}" placeholder="https://dandelion-gigantic-challenge.ngrok-free.dev" required>
+            <input type="text" id="crmBaseUrl" value="{config['crm_base_url']}" placeholder="https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com" required>
         </div>
         <div class="form-group">
             <label>Tenant ID (X-Tenant-Key)</label>
@@ -1430,3 +1853,18 @@ async def test_crm_connection_endpoint(client_id: str = "glaze-dental", test_dat
             },
             status_code=502
         )
+
+
+@app.get("/api/appointments")
+@app.get("/api/v1/appointments")
+async def get_appointments_api(client_id: str = "glaze-dental", date: Optional[str] = None):
+    filters = {}
+    if date:
+        filters["date"] = date
+    res = get_appointments(client_id, filters)
+    if res.get("status") == "success":
+        return res.get("data", [])
+    return JSONResponse(
+        {"status": "error", "message": res.get("message", "Failed to retrieve appointments from CRM")},
+        status_code=res.get("status_code", 502)
+    )

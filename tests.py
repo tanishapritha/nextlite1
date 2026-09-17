@@ -2,217 +2,672 @@ import os
 import json
 import sqlite3
 import datetime
+import pytest
+from unittest.mock import MagicMock
 from fastapi.testclient import TestClient
 
-# Set dummy env vars for test suite
+# Set environment variables for testing environment
 os.environ["META_VERIFY_TOKEN"] = "nextlite-demo"
 os.environ["META_GRAPH_API_VERSION"] = "v26.0"
+os.environ["META_PHONE_NUMBER_ID"] = "1208541249018781"
 
 import app
 
-client = TestClient(app.app)
-
-# Capture outbound payloads for assertion
 sent_messages = []
+
 
 def mock_send_payload(payload):
     sent_messages.append(payload)
     return True
 
-app._send_payload = mock_send_payload
+
+@pytest.fixture(autouse=True)
+def setup_test_environment(tmp_path, monkeypatch):
+    """
+    Pytest fixture providing complete test isolation:
+    - Creates a fresh temporary SQLite DB for every test
+    - Mocks external network sending, Gemini, and CRM HTTP calls
+    """
+    db_file = tmp_path / "test_nextlite.db"
+    monkeypatch.setattr(app, "DB_PATH", str(db_file))
+    app.init_db()
+
+    global sent_messages
+    sent_messages = []
+
+    # Mock outbound Meta payload sending
+    monkeypatch.setattr(app, "_send_payload", mock_send_payload)
+    monkeypatch.setattr(app.MetaCloudProvider, "_send_payload", mock_send_payload)
+
+    yield
+
+
+@pytest.fixture
+def test_client():
+    return TestClient(app.app)
+
 
 TEST_PHONE = "+919999988888"
 
 
-def run_tests():
-    global sent_messages
-    passed = 0
-    total = 0
+# ============================================================
+# 1. APPLICATION IMPORT & ROUTE AUDIT
+# ============================================================
 
-    def assert_test(name, condition):
-        nonlocal passed, total
-        total += 1
-        if condition:
-            print(f"PASS | {name}")
-            passed += 1
-        else:
-            print(f"FAIL | {name}")
+def test_01_app_compilation_and_routes(test_client):
+    r_root = test_client.get("/")
+    r_health = test_client.get("/health")
+    assert r_root.status_code == 200
+    assert r_root.json().get("service") == "Glaze Dental Clinic WhatsApp AI"
+    assert r_health.status_code == 200
+    assert r_health.json().get("database") == "connected"
 
-    print("\n--- Running Glaze Dental Clinic CRM WhatsApp Tests ---")
 
-    # 1. Health Check
-    r_root = client.get("/")
-    assert_test(
-        "1. GET / Health check",
-        r_root.status_code == 200 and r_root.json().get("service") == "Glaze Dental Clinic WhatsApp AI"
+# ============================================================
+# 2. WEBHOOK VERIFICATION
+# ============================================================
+
+def test_02_webhook_verification(test_client):
+    # Valid verify token
+    r_ok = test_client.get("/webhook?hub.mode=subscribe&hub.verify_token=nextlite-demo&hub.challenge=test_123")
+    assert r_ok.status_code == 200
+    assert r_ok.text == "test_123"
+
+    # Invalid verify token
+    r_bad = test_client.get("/webhook?hub.mode=subscribe&hub.verify_token=wrong-token&hub.challenge=test_123")
+    assert r_bad.status_code == 403
+
+    # Missing parameters
+    r_missing = test_client.get("/webhook")
+    assert r_missing.status_code == 403
+
+
+# ============================================================
+# 3. WEBHOOK PAYLOAD PARSING & UNHANDLED TYPES
+# ============================================================
+
+def test_03_webhook_payload_parsing(test_client):
+    text_payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {"phone_number_id": "1208541249018781"},
+                    "messages": [{
+                        "id": "wamid.TXT1",
+                        "from": TEST_PHONE,
+                        "type": "text",
+                        "text": {"body": "hi"}
+                    }]
+                }
+            }]
+        }]
+    }
+    r_txt = test_client.post("/webhook", json=text_payload)
+    assert r_txt.status_code == 200
+    assert r_txt.json().get("processed") == 1
+
+    unsupp_payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {"phone_number_id": "1208541249018781"},
+                    "messages": [{
+                        "id": "wamid.STK1",
+                        "from": TEST_PHONE,
+                        "type": "sticker",
+                        "sticker": {"id": "stk_999"}
+                    }]
+                }
+            }]
+        }]
+    }
+    r_stk = test_client.post("/webhook", json=unsupp_payload)
+    assert r_stk.status_code == 200
+    assert r_stk.json().get("processed") == 1
+
+
+# ============================================================
+# 4. META MESSAGE IDEMPOTENCY
+# ============================================================
+
+def test_04_webhook_idempotency(test_client):
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {"phone_number_id": "1208541249018781"},
+                    "messages": [{
+                        "id": "wamid.DUP123",
+                        "from": TEST_PHONE,
+                        "type": "text",
+                        "text": {"body": "hi"}
+                    }]
+                }
+            }]
+        }]
+    }
+
+    sent_messages.clear()
+    r1 = test_client.post("/webhook", json=payload)
+    assert r1.status_code == 200
+    assert r1.json().get("processed") == 1
+    assert len(sent_messages) == 1
+
+    sent_messages.clear()
+    r2 = test_client.post("/webhook", json=payload)
+    assert r2.status_code == 200
+    assert r2.json().get("ignored_duplicates") == 1
+    assert len(sent_messages) == 0  # Second delivery ignored, no duplicate message sent
+
+
+# ============================================================
+# 5. CRM GET SLOTS TESTS (Success, Empty, Timeout, 500, Headers)
+# ============================================================
+
+def test_05_crm_get_slots_http_integration(monkeypatch):
+    captured_requests = []
+
+    def mock_requests_get(url, params=None, headers=None, timeout=15):
+        captured_requests.append({"url": url, "params": params, "headers": headers})
+
+        class MockResponse:
+            status_code = 200
+
+            def json(self):
+                return {"status": "success", "availableSlots": ["10:00 AM", "11:00 AM"]}
+
+        return MockResponse()
+
+    monkeypatch.setattr(app.requests, "get", mock_requests_get)
+
+    slots = app.CRMClient.get_available_slots("glaze-dental", "2026-09-21")
+
+    assert slots == ["10:00 AM", "11:00 AM"]
+    assert len(captured_requests) == 1
+    assert "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com/api/v1/integrations/whatsapp/slots" in captured_requests[0]["url"]
+    assert captured_requests[0]["params"]["date"] == "2026-09-21"
+    assert captured_requests[0]["headers"]["X-Tenant-Key"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120"
+
+
+def test_05b_crm_get_slots_empty_and_failures(monkeypatch):
+    # Empty slots
+    monkeypatch.setattr(app.requests, "get", lambda *a, **k: type("R", (), {"status_code": 200, "json": lambda s: {"availableSlots": []}})())
+    slots_empty = app.CRMClient.get_available_slots("glaze-dental", "2026-09-21")
+    assert slots_empty == []
+
+    # Timeout
+    def mock_timeout(*a, **k):
+        raise app.requests.RequestException("Timeout")
+
+    monkeypatch.setattr(app.requests, "get", mock_timeout)
+    slots_timeout = app.CRMClient.get_available_slots("glaze-dental", "2026-09-21")
+    assert slots_timeout is None
+
+    # HTTP 500
+    monkeypatch.setattr(app.requests, "get", lambda *a, **k: type("R", (), {"status_code": 500, "text": "Internal Error"})())
+    slots_500 = app.CRMClient.get_available_slots("glaze-dental", "2026-09-21")
+    assert slots_500 is None
+
+
+# ============================================================
+# 6. CRM BOOKING 201 SUCCESS & PAYLOAD / HEADER VERIFICATION
+# ============================================================
+
+def test_06_crm_booking_201_success(monkeypatch):
+    captured_posts = []
+
+    def mock_requests_post(url, headers=None, json=None, timeout=20):
+        captured_posts.append({"url": url, "headers": headers, "json": json})
+
+        class MockResponse:
+            status_code = 201
+            text = '{"appointmentId": "CRM-201-OK"}'
+
+            def json(self):
+                return {"appointmentId": "CRM-201-OK"}
+
+        return MockResponse()
+
+    monkeypatch.setattr(app.requests, "post", mock_requests_post)
+
+    res = app.CRMClient.book_appointment(
+        client_id="glaze-dental",
+        customer_name="Rahul Sharma",
+        customer_phone=TEST_PHONE,
+        booking_date="2026-09-21",
+        booking_time="10:00 AM"
     )
 
-    # 2. Webhook verification
-    r_ver = client.get("/webhook?hub.mode=subscribe&hub.verify_token=nextlite-demo&hub.challenge=test_challenge")
-    assert_test(
-        "2. GET /webhook verification",
-        r_ver.status_code == 200 and r_ver.text == "test_challenge"
-    )
+    assert res["status"] == "success"
+    assert res["data"]["appointmentId"] == "CRM-201-OK"
+    assert len(captured_posts) == 1
+    assert "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com/api/v1/integrations/whatsapp/appointments/book" in captured_posts[0]["url"]
+    assert captured_posts[0]["headers"]["X-Tenant-Key"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120"
 
-    # 3. Client CRM Config resolution & Dashboard API
-    crm_cfg = app.get_client_crm_config("glaze-dental")
-    assert_test(
-        "3. Client CRM config resolution",
-        crm_cfg is not None and
-        crm_cfg["crm_tenant_id"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120" and
-        crm_cfg["crm_base_url"] == "https://dandelion-gigantic-challenge.ngrok-free.dev"
-    )
+    payload = captured_posts[0]["json"]
+    assert payload["customerName"] == "Rahul Sharma"
+    assert payload["customerPhone"] == TEST_PHONE
+    assert payload["bookingDate"] == "2026-09-21"
+    assert payload["bookingTime"] == "10:00 AM"
+    assert payload["title"] == "WhatsApp Consultation"
 
-    # 4. Test CRM slots live check
-    slots = app.get_available_slots("glaze-dental", "2026-09-16")
-    assert_test(
-        "4. Live CRM GET /slots integration",
-        slots is not None and isinstance(slots, list) and len(slots) > 0
-    )
 
-    # 5. Reset & Greeting ("hi")
+# ============================================================
+# 7. BOOKING CONFIRMATION STOP (NO WELCOME LOOP)
+# ============================================================
+
+def test_07_booking_confirmation_stop_no_welcome_loop(monkeypatch):
     app.reset_conversation(TEST_PHONE)
-    sent_messages = []
+
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app, "book_appointment", lambda **kw: {"status": "success", "data": {"appointmentId": "CRM-777"}})
+    monkeypatch.setattr(app.CRMClient, "book_appointment", lambda **kw: {"status": "success", "data": {"appointmentId": "CRM-777"}})
+
+    mon_dt = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7 or 7)
+
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
+    app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
+    app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
+
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "interactive", "Confirm", action_id="confirm_booking")
+
+    conv_done = app.get_conversation(TEST_PHONE)
+    assert conv_done["state"] == "IDLE"
+    assert len(sent_messages) == 1  # Confirmation ONLY
+    assert "Your appointment has been confirmed" in sent_messages[0]["text"]["body"]
+    assert "Welcome to Glaze" not in sent_messages[0]["text"]["body"]  # NO WELCOME MENU LOOP!
+
+
+# ============================================================
+# 8. CRM 409 CONFLICT HANDLING
+# ============================================================
+
+def test_08_crm_409_conflict_handling(monkeypatch):
+    app.reset_conversation(TEST_PHONE)
+
+    mon_dt = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7 or 7)
+
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["10:00 AM", "12:00 PM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM", "12:00 PM"])
+
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
+    app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
+    app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
+
+    monkeypatch.setattr(app, "book_appointment", lambda **kw: {"status": "conflict", "data": {}})
+    monkeypatch.setattr(app.CRMClient, "book_appointment", lambda **kw: {"status": "conflict", "data": {}})
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["12:00 PM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["12:00 PM"])
+
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "interactive", "Confirm", action_id="confirm_booking")
+
+    conv_conflict = app.get_conversation(TEST_PHONE)
+    assert conv_conflict["state"] == "BOOKING_TIME"
+    assert len(sent_messages) >= 2
+    assert "already booked" in sent_messages[0]["text"]["body"].lower()
+
+
+# ============================================================
+# 9. CRM OTHER FAILURES (401, 403, 429, 500) & NO CREDENTIAL LEAKAGE
+# ============================================================
+
+def test_09_crm_other_failures_no_leakage(monkeypatch):
+    app.reset_conversation(TEST_PHONE)
+
+    mon_dt = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7 or 7)
+
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM"])
+
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
+    app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
+    app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
+
+    monkeypatch.setattr(app, "book_appointment", lambda **kw: {"status": "error", "data": {}})
+    monkeypatch.setattr(app.CRMClient, "book_appointment", lambda **kw: {"status": "error", "data": {}})
+
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "interactive", "Confirm", action_id="confirm_booking")
+
+    conv_err = app.get_conversation(TEST_PHONE)
+    assert conv_err["state"] == "IDLE"
+    assert len(sent_messages) == 1
+    text_out = sent_messages[0]["text"]["body"]
+    assert "9822977740" in text_out
+    assert "6b4b6128" not in text_out  # No tenant secret leakage
+    assert "azure" not in text_out.lower()  # No internal CRM URL leakage
+
+
+# ============================================================
+# 10. DOUBLE BOOKING PROTECTION
+# ============================================================
+
+def test_10_double_booking_protection(monkeypatch):
+    conn = app.get_db()
+    conn.execute("DELETE FROM appointments")
+    conn.commit()
+
+    mon_dt = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7 or 7)
+
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app, "book_appointment", lambda **kw: {"status": "success", "data": {"appointmentId": "APT-1"}})
+    monkeypatch.setattr(app.CRMClient, "book_appointment", lambda **kw: {"status": "success", "data": {"appointmentId": "APT-1"}})
+
+    app.reset_conversation("+911111111111")
+    app.handle_user_message("+911111111111", "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message("+911111111111", "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message("+911111111111", "text", "Patient One")
+    app.handle_user_message("+911111111111", "interactive", "New patient", action_id="patient_new")
+    app.handle_user_message("+911111111111", "text", mon_dt.isoformat())
+    app.handle_user_message("+911111111111", "interactive", "10:00 AM", action_id="time_10:00 AM")
+    app.handle_user_message("+911111111111", "interactive", "Confirm", action_id="confirm_booking")
+
+    # Second booking returns 409 Conflict
+    monkeypatch.setattr(app, "book_appointment", lambda **kw: {"status": "conflict", "data": {}})
+    monkeypatch.setattr(app.CRMClient, "book_appointment", lambda **kw: {"status": "conflict", "data": {}})
+
+    app.reset_conversation("+912222222222")
+    app.handle_user_message("+912222222222", "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message("+912222222222", "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message("+912222222222", "text", "Patient Two")
+    app.handle_user_message("+912222222222", "interactive", "New patient", action_id="patient_new")
+    app.handle_user_message("+912222222222", "text", mon_dt.isoformat())
+    app.handle_user_message("+912222222222", "interactive", "10:00 AM", action_id="time_10:00 AM")
+    app.handle_user_message("+912222222222", "interactive", "Confirm", action_id="confirm_booking")
+
+    row_count = conn.execute("SELECT COUNT(*) FROM appointments").fetchone()[0]
+    conn.close()
+    assert row_count == 1  # Only 1 successful local appointment saved
+
+
+# ============================================================
+# 11. CRM SUCCESS + WHATSAPP OUTBOUND FAILURE PROTECTION
+# ============================================================
+
+def test_11_crm_success_whatsapp_failure_protection(monkeypatch):
+    conn = app.get_db()
+    conn.execute("DELETE FROM appointments")
+    conn.commit()
+
+    mon_dt = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7 or 7)
+
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM"])
+
+    book_call_count = 0
+
+    def mock_book(**kw):
+        nonlocal book_call_count
+        book_call_count += 1
+        return {"status": "success", "data": {"appointmentId": "APT-99"}}
+
+    monkeypatch.setattr(app, "book_appointment", mock_book)
+    monkeypatch.setattr(app.CRMClient, "book_appointment", mock_book)
+    monkeypatch.setattr(app, "_send_payload", lambda p: False)
+
+    app.reset_conversation(TEST_PHONE)
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "text", "Test Patient")
+    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
+    app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
+    app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
+    app.handle_user_message(TEST_PHONE, "interactive", "Confirm", action_id="confirm_booking")
+
+    row_count = conn.execute("SELECT COUNT(*) FROM appointments").fetchone()[0]
+    conn.close()
+    assert book_call_count == 1
+    assert row_count == 1  # Appointment remains saved; no duplicate CRM booking retry
+
+
+# ============================================================
+# 12. GET APPOINTMENTS & CANCEL ENDPOINT INTERFACE TESTS
+# ============================================================
+
+def test_12_crm_get_appointments_and_cancel_interface(test_client, monkeypatch):
+    captured_get = []
+    captured_post = []
+
+    def mock_get(url, params=None, headers=None, timeout=15):
+        captured_get.append({"url": url, "params": params, "headers": headers})
+        class MockR:
+            status_code = 200
+            text = '[{"id": "APT-101", "customerName": "John"}]'
+            def json(self): return [{"id": "APT-101", "customerName": "John"}]
+        return MockR()
+
+    def mock_post(url, headers=None, json=None, timeout=20):
+        captured_post.append({"url": url, "headers": headers, "json": json})
+        class MockR:
+            status_code = 200
+            text = '{"status": "cancelled"}'
+            def json(self): return {"status": "cancelled"}
+        return MockR()
+
+    monkeypatch.setattr(app.requests, "get", mock_get)
+    monkeypatch.setattr(app.requests, "post", mock_post)
+
+    # Test GET appointments via proxy
+    r_apts = test_client.get("/api/appointments?client_id=glaze-dental")
+    assert r_apts.status_code == 200
+    assert len(r_apts.json()) == 1
+    assert captured_get[0]["headers"]["X-Tenant-Key"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120"
+
+    # Test Cancel interface method
+    cancel_res = app.cancel_appointment("glaze-dental", {"appointmentId": "APT-101"})
+    assert cancel_res["status"] == "success"
+    assert captured_post[0]["headers"]["X-Tenant-Key"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120"
+    assert "/appointments/cancel" in captured_post[0]["url"]
+
+
+# ============================================================
+# 13. TENANT ISOLATION & DYNAMIC TENANT CONFIGURATION
+# ============================================================
+
+def test_13_tenant_isolation_multi_client(monkeypatch):
+    app.save_client_crm_config("client-a", "Client A", "https://crm-a.example", "tenant-key-A", phone_number_id="phone_A")
+    app.save_client_crm_config("client-b", "Client B", "https://crm-b.example", "tenant-key-B", phone_number_id="phone_B")
+
+    captured_requests = []
+
+    def mock_get(url, params=None, headers=None, timeout=15):
+        captured_requests.append({"url": url, "headers": headers})
+        class MockR:
+            status_code = 200
+            text = '{"availableSlots": ["10:00 AM"]}'
+            def json(self): return {"availableSlots": ["10:00 AM"]}
+        return MockR()
+
+    monkeypatch.setattr(app.requests, "get", mock_get)
+
+    # Client A slots call
+    app.CRMClient.get_available_slots("client-a", "2026-09-21")
+    # Client B slots call
+    app.CRMClient.get_available_slots("client-b", "2026-09-21")
+
+    assert len(captured_requests) == 2
+    assert "https://crm-a.example" in captured_requests[0]["url"]
+    assert captured_requests[0]["headers"]["X-Tenant-Key"] == "tenant-key-A"
+
+    assert "https://crm-b.example" in captured_requests[1]["url"]
+    assert captured_requests[1]["headers"]["X-Tenant-Key"] == "tenant-key-B"
+
+
+# ============================================================
+# 14. EMERGENCY INTERCEPTOR PRIORITY
+# ============================================================
+
+def test_14_emergency_interceptor_priority():
+    for emergency_kw in ["accident", "severe pain", "extreme pain", "allergy", "urgent"]:
+        app.reset_conversation(TEST_PHONE)
+        sent_messages.clear()
+        app.handle_user_message(TEST_PHONE, "text", f"Emergency! I have {emergency_kw}")
+        assert len(sent_messages) == 1
+        assert "9822977740" in sent_messages[0]["text"]["body"]
+        assert app.get_conversation(TEST_PHONE)["state"] == "IDLE"
+
+    # Emergency during active booking state
+    app.reset_conversation(TEST_PHONE)
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_NAME"
+
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "text", "Emergency! I had an accident")
+    assert len(sent_messages) == 1
+    assert "9822977740" in sent_messages[0]["text"]["body"]
+    assert app.get_conversation(TEST_PHONE)["state"] == "IDLE"
+
+
+# ============================================================
+# 15. PRICING SAFETY (NO INVENTED PRICES)
+# ============================================================
+
+def test_15_pricing_safety():
+    for q in ["How much is RCT?", "What is the cost?", "How much does treatment cost?"]:
+        app.reset_conversation(TEST_PHONE)
+        sent_messages.clear()
+        app.handle_user_message(TEST_PHONE, "text", q)
+        assert len(sent_messages) >= 1
+        assert "Pricing details are not listed" in sent_messages[0]["text"]["body"]
+        assert "9822977740" in sent_messages[0]["text"]["body"]
+
+
+# ============================================================
+# 16. DATE & TIME VALIDATION (PAST DATES & SUNDAYS)
+# ============================================================
+
+def test_16_date_time_validation():
+    app.reset_conversation(TEST_PHONE)
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
+
+    # Past date
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "text", "2019-05-10")
+    assert len(sent_messages) == 2
+    assert "past dates" in sent_messages[0]["text"]["body"].lower()
+
+    # Sunday
+    sent_messages.clear()
+    sunday_dt = datetime.date.today() + datetime.timedelta(days=(6 - datetime.date.today().weekday()) % 7 or 7)
+    app.handle_user_message(TEST_PHONE, "text", sunday_dt.isoformat())
+    assert len(sent_messages) == 2
+    assert "closed on sundays" in sent_messages[0]["text"]["body"].lower()
+
+
+# ============================================================
+# 17. CUSTOMER-FACING BRANDING & SERVICE AUDIT
+# ============================================================
+
+def test_17_customer_facing_branding_and_services():
+    services = app.get_configured_services()
+    assert len(services) == 2
+
+    app.reset_conversation(TEST_PHONE)
+    sent_messages.clear()
     app.handle_user_message(TEST_PHONE, "text", "hi")
-    assert_test(
-        "5. 'hi' -> Glaze Dental Clinic main menu buttons",
-        len(sent_messages) == 1 and
-        sent_messages[0]["type"] == "interactive" and
-        "Glaze Dental Clinic" in sent_messages[0]["interactive"]["body"]["text"] and
-        "SmileCare" not in sent_messages[0]["interactive"]["body"]["text"] and
-        "Nextlite" not in sent_messages[0]["interactive"]["body"]["text"]
-    )
 
-    # 6. Emergency routing (Priority)
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "text", "I have severe pain after an accident")
-    assert_test(
-        "6. Emergency keyword priority routing",
-        len(sent_messages) == 1 and
-        "9822977740" in sent_messages[0]["text"]["body"] and
-        "urgent" in sent_messages[0]["text"]["body"].lower() and
-        app.get_conversation(TEST_PHONE)["state"] == "IDLE"
-    )
+    text_content = sent_messages[0]["interactive"]["body"]["text"]
+    assert "Glaze Dental Clinic" in text_content
+    assert "Nextlite" not in text_content
+    assert "nextlite1" not in text_content
+    assert "SmileCare" not in text_content
+    assert "Meta" not in text_content
 
-    # 7. Price inquiry safety
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "text", "How much does RCT cost?")
-    assert_test(
-        "7. Pricing safety (no invented prices)",
-        len(sent_messages) >= 1 and
-        "Pricing details are not listed" in sent_messages[0]["text"]["body"] and
-        "9822977740" in sent_messages[0]["text"]["body"]
-    )
 
-    # 8. Booking Flow: Step 1 -> Service Selection
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    conv = app.get_conversation(TEST_PHONE)
-    assert_test(
-        "8. Book appointment -> BOOKING_SERVICE",
-        conv["state"] == "BOOKING_SERVICE" and
-        len(sent_messages) == 1 and
-        sent_messages[0]["interactive"]["type"] == "list"
-    )
+# ============================================================
+# 18. INFORMATIONAL AI FALLBACK (GEMINI)
+# ============================================================
 
-    # 9. Booking Flow: Step 2 -> Name input
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "interactive", "RCT", action_id="booking_service_0")
-    conv = app.get_conversation(TEST_PHONE)
-    assert_test(
-        "9. Service selected -> BOOKING_NAME",
-        conv["state"] == "BOOKING_NAME" and
-        conv["service"] == "RCT" and
-        len(sent_messages) == 1 and
-        "full name" in sent_messages[0]["text"]["body"]
-    )
+def test_18_informational_ai_fallback(monkeypatch):
+    class DummyGeminiModel:
+        def generate_content(self, prompt, generation_config=None):
+            class Resp:
+                text = "Dr SHADAB MULLA is a Dental Surgeon with 20 years of experience."
+            return Resp()
 
-    # 10. Booking Flow: Step 3 -> Patient Type
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
-    conv = app.get_conversation(TEST_PHONE)
-    assert_test(
-        "10. Name entered -> BOOKING_PATIENT_TYPE",
-        conv["state"] == "BOOKING_PATIENT_TYPE" and
-        conv["patient_name"] == "Rahul Sharma" and
-        len(sent_messages) == 1 and
-        sent_messages[0]["interactive"]["type"] == "button"
-    )
+    monkeypatch.setattr(app, "gemini_model", DummyGeminiModel())
 
-    # 11. Booking Flow: Step 4 -> Date Selection
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
-    conv = app.get_conversation(TEST_PHONE)
-    assert_test(
-        "11. Patient type selected -> BOOKING_DATE",
-        conv["state"] == "BOOKING_DATE" and
-        conv["patient_type"] == "New" and
-        len(sent_messages) == 1 and
-        sent_messages[0]["interactive"]["type"] == "button"
-    )
-
-    # 12. Booking Flow: Step 5 -> CRM Live Slots fetched -> Time Selection
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "text", "2026-09-16")
-    conv = app.get_conversation(TEST_PHONE)
-    assert_test(
-        "12. Date entered -> CRM slots fetched -> BOOKING_TIME",
-        conv["state"] == "BOOKING_TIME" and
-        conv["appointment_date"] == "2026-09-16" and
-        len(sent_messages) == 1 and
-        sent_messages[0]["interactive"]["type"] == "list" and
-        len(sent_messages[0]["interactive"]["action"]["sections"][0]["rows"]) > 0
-    )
-
-    # 13. Booking Flow: Step 6 -> Confirmation Prompt
-    sent_messages = []
-    app.handle_user_message(TEST_PHONE, "interactive", "12:00 PM", action_id="time_12:00 PM")
-    conv = app.get_conversation(TEST_PHONE)
-    assert_test(
-        "13. Time selected -> BOOKING_CONFIRMATION summary",
-        conv["state"] == "BOOKING_CONFIRMATION" and
-        conv["appointment_time"] == "12:00 PM" and
-        len(sent_messages) == 1 and
-        "Rahul Sharma" in sent_messages[0]["interactive"]["body"]["text"] and
-        "RCT" in sent_messages[0]["interactive"]["body"]["text"]
-    )
-
-    # 14. CRM Conflict (409) Handling on confirmation
-    # Re-run booking flow up to BOOKING_CONFIRMATION, then mock book_appointment to return 409
     app.reset_conversation(TEST_PHONE)
-    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message(TEST_PHONE, "interactive", "RCT", action_id="booking_service_0")
-    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
-    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
-    app.handle_user_message(TEST_PHONE, "text", "2026-09-16")
-    app.handle_user_message(TEST_PHONE, "interactive", "12:00 PM", action_id="time_12:00 PM")
-    _real_book = app.book_appointment
-    try:
-        app.book_appointment = lambda **kw: {"status": "conflict", "data": {}}
-        sent_messages = []
-        app.handle_user_message(TEST_PHONE, "interactive", "Confirm", action_id="confirm_booking")
-    finally:
-        app.book_appointment = _real_book
-    assert_test(
-        "14. CRM 409 conflict detected -> No confirmation, refresh slots",
-        len(sent_messages) >= 1 and
-        "already booked" in sent_messages[0]["text"]["body"].lower() and
-        app.get_conversation(TEST_PHONE)["state"] in ["BOOKING_TIME", "BOOKING_DATE"]
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "text", "Tell me about the doctor")
+
+    assert len(sent_messages) >= 1
+    assert "Dr SHADAB MULLA" in sent_messages[0]["text"]["body"]
+
+
+# ============================================================
+# 19. APPOINTMENT REMINDERS & SCHEDULER
+# ============================================================
+
+def test_19_appointment_reminders():
+    conn = app.get_db()
+    conn.execute("DELETE FROM reminders")
+    conn.commit()
+    conn.close()
+
+    today_str = datetime.date.today().isoformat()
+    scheduled = app.schedule_appointment_reminder(
+        appointment_id=888,
+        client_id="glaze-dental",
+        phone=TEST_PHONE,
+        appointment_date=today_str,
+        appointment_time="12:00 PM"
     )
+    assert scheduled is True
 
-    # 15. Dashboard UI & Test CRM Connection Endpoint
-    r_dash = client.get("/dashboard?client_id=glaze-dental")
-    r_test_crm = client.get("/api/test-crm-connection?client_id=glaze-dental&test_date=2026-09-16")
-    assert_test(
-        "15. Dashboard UI and GET /api/test-crm-connection",
-        r_dash.status_code == 200 and
-        r_test_crm.status_code == 200 and
-        r_test_crm.json().get("status") == "success"
+    # Uniqueness constraint: duplicate call ignores insert
+    scheduled_dup = app.schedule_appointment_reminder(
+        appointment_id=888,
+        client_id="glaze-dental",
+        phone=TEST_PHONE,
+        appointment_date=today_str,
+        appointment_time="12:00 PM"
     )
+    assert scheduled_dup is True
 
-    print(f"\n--- Total: {passed}/{total} tests passed ---")
-    if passed != total:
-        raise SystemExit(1)
+    # Force reminder to past to test due worker
+    conn = app.get_db()
+    past_iso = (datetime.datetime.now(app.TIMEZONE_KOLKATA) - datetime.timedelta(minutes=5)).isoformat()
+    conn.execute("UPDATE reminders SET scheduled_at = ? WHERE appointment_id = 888", (past_iso,))
+    conn.commit()
+    conn.close()
 
-if __name__ == "__main__":
-    run_tests()
+    sent_messages.clear()
+    sent_count = app.process_due_reminders()
+    assert sent_count == 1
+    assert len(sent_messages) >= 1
+
+
+# ============================================================
+# 20. SECURITY & CREDENTIAL EXPOSURE
+# ============================================================
+
+def test_20_security_credentials_and_logging(test_client):
+    r_cfg = test_client.get("/api/client-config?client_id=glaze-dental")
+    assert r_cfg.status_code == 200
+    data = r_cfg.json()
+    assert "crm_tenant_id" in data
+    assert "META_WHATSAPP_TOKEN" not in json.dumps(data)

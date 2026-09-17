@@ -1,38 +1,59 @@
 {
-  "company": {
-    "name": "SmileCare Dental Clinic (Demo)",
-    "description": "A modern dental practice providing high-quality preventive, restorative, and cosmetic dental care.",
-    "location": "Nagpur, Maharashtra, India"
+  "client_id": "glaze-dental",
+  "client_name": "Glaze Dental Clinic",
+  "crm_base_url": "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com",
+  "crm_tenant_id": "6b4b6128-5b5f-4d2f-b5de-91511ab9b120",
+  "phone_number_id": "1208541249018781",
+  "assistant_name": "Glaze Dental Clinic Assistant",
+  "doctor": {
+    "name": "Dr SHADAB MULLA",
+    "qualification": "B.D.S.",
+    "designation": "DENTAL SURGEON",
+    "experience": "20 years"
   },
-  "business_hours": {
-    "monday_to_friday": "9:00 AM to 7:00 PM",
-    "saturday": "9:00 AM to 3:00 PM",
-    "sunday": "Closed (Emergency on call)"
-  },
-  "services": [
-    "Dental consultation",
-    "Teeth cleaning",
-    "Root canal consultation",
-    "Cavity fillings",
-    "Teeth whitening"
+  "languages": [
+    "English",
+    "Hindi",
+    "Marathi",
+    "Hinglish"
   ],
-  "clinic_info": {
-    "about": "SmileCare Dental Clinic offers compassionate dental treatments using modern technology and strict sterilization protocols.",
-    "emergency": "For urgent dental trauma or severe pain after hours, please contact our emergency helpline or visit our clinic during open hours.",
-    "consultation_policy": "New patient consultations typically take 30-45 minutes including initial examination and dental X-rays if needed."
+  "location": {
+    "address": "SHOP NO 1 MONIKA 16 PIMPRI COLONY",
+    "maps": "https://maps.app.goo.gl/H6872MYf2gdthTZ7A?g_st=ac"
   },
   "contact": {
-    "phone": "+91 98765 43210",
-    "email": "care@smilecaredental.demo",
-    "address": "SmileCare Dental Clinic, Civil Lines, Nagpur, Maharashtra, India"
+    "phone": "9822977740",
+    "whatsapp": "9822977740"
   },
-  "refund_policy": "Appointment cancellations or rescheduling requests can be made up to 4 hours in advance at no charge.",
-  "appointment": {
-    "demo_slots": [
-      "10:00 AM",
-      "11:30 AM",
-      "2:00 PM",
-      "4:30 PM"
-    ]
+  "services": [
+    {
+      "name": "Root Canal Treatment (RCT)",
+      "description": "Root canal treatment for tooth pain."
+    },
+    {
+      "name": "Painless Extractions",
+      "description": "Specialised in painless dental treatment."
+    }
+  ],
+  "clinic": {
+    "speciality": "Painless treatment",
+    "appointment_duration": "30 minutes"
+  },
+  "hours": {
+    "days": [
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday"
+    ],
+    "morning": "10 AM-1 PM",
+    "evening": "6 PM-9 PM"
+  },
+  "emergency": {
+    "enabled": true,
+    "phone": "9822977740",
+    "instruction": "🚨 This may require urgent attention. Please call Glaze Dental Clinic at 9822977740 immediately for emergency assistance."
   }
 }

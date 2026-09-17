@@ -58,7 +58,7 @@ gemini_model = None
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        gemini_model = genai.GenerativeModel("gemini-2.5-flash")
         logger.info("Gemini initialized successfully")
     except Exception as exc:
         logger.error("Gemini initialization failed | %s: %s", type(exc).__name__, exc)
@@ -309,13 +309,18 @@ def init_db():
     seed_crm_tenant_id = KNOWLEDGE.get("crm_tenant_id", "6b4b6128-5b5f-4d2f-b5de-91511ab9b120").strip()
     seed_phone_number_id = KNOWLEDGE.get("phone_number_id", PHONE_NUMBER_ID)
 
-    cursor.execute("SELECT client_id FROM client_config WHERE client_id = ?", (seed_client_id,))
-    if not cursor.fetchone():
-        cursor.execute("""
-            INSERT INTO client_config (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (seed_client_id, seed_client_name, seed_phone_number_id, seed_crm_base_url, seed_crm_tenant_id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
-        logger.info("Seeded initial CRM configuration for client: %s", seed_client_id)
+    # Always upsert so that changes to nextlite.json take effect without wiping the DB.
+    cursor.execute("""
+        INSERT INTO client_config (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(client_id) DO UPDATE SET
+            crm_base_url = excluded.crm_base_url,
+            crm_tenant_id = excluded.crm_tenant_id,
+            client_name = excluded.client_name,
+            phone_number_id = excluded.phone_number_id,
+            updated_at = excluded.updated_at
+    """, (seed_client_id, seed_client_name, seed_phone_number_id, seed_crm_base_url, seed_crm_tenant_id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
+    logger.info("Upserted CRM configuration for client: %s | base_url: %s", seed_client_id, seed_crm_base_url)
 
     conn.commit()
     conn.close()
@@ -1145,8 +1150,13 @@ def is_pricing_question(text: str) -> bool:
 # ============================================================
 
 def ask_gemini(question: str) -> Optional[str]:
-    if not gemini_model:
+    import sys
+    # Look up via the top-level 'app' package so monkeypatching app.gemini_model in tests works.
+    _pkg = sys.modules.get("app", sys.modules[__name__])
+    _model = getattr(_pkg, "gemini_model", None)
+    if not _model:
         return None
+
 
     knowledge_text = json.dumps(KNOWLEDGE, ensure_ascii=False, indent=2)
 
@@ -1169,7 +1179,7 @@ Customer question:
 {question}
 """
     try:
-        response = gemini_model.generate_content(
+        response = _model.generate_content(
             prompt,
             generation_config={"temperature": 0.2, "max_output_tokens": 200}
         )

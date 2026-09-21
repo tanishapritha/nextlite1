@@ -20,9 +20,11 @@ cp .env.example .env
 Contents of `.env`:
 ```env
 META_VERIFY_TOKEN=nextlite-demo
-META_WHATSAPP_TOKEN=your_meta_whatsapp_token
-META_PHONE_NUMBER_ID=1208541249018781
+GLAZE_WHATSAPP_TOKEN=your_glaze_meta_access_token
+META_VERIFY_TOKEN=your_webhook_verify_token
+META_APP_SECRET=your_meta_app_secret
 META_GRAPH_API_VERSION=v26.0
+GLAZE_CRM_TENANT_KEY=your_glaze_crm_tenant_key
 META_REMINDER_TEMPLATE=glaze_appointment_1h_reminder
 GEMINI_API_KEY=optional_gemini_api_key
 ```
@@ -68,7 +70,7 @@ In the Meta App Dashboard:
 ### 9. Configure CRM Integration
 Open the admin dashboard at:
 `https://<your-render-app>.onrender.com/dashboard`
-Or set `crm_base_url` and `crm_tenant_id` via API:
+Client credentials are kept server-side; do not put them in `nextlite.json`.
 - CRM Base URL: `https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com`
 - Tenant ID: `6b4b6128-5b5f-4d2f-b5de-91511ab9b120`
 

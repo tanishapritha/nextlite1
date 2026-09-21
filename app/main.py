@@ -471,27 +471,31 @@ def get_client_whatsapp_config(client_id: str) -> Optional[Dict[str, Any]]:
     return config
 
 
-def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, crm_tenant_id: str, phone_number_id: Optional[str] = None) -> bool:
+def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, crm_tenant_id: str = "", phone_number_id: Optional[str] = None) -> bool:
     parsed = urlparse(crm_base_url.strip())
     if not (parsed.scheme in ["http", "https"] and parsed.netloc):
         raise ValueError("crm_base_url must be a valid HTTP or HTTPS URL.")
 
     crm_tenant_id = crm_tenant_id.strip()
-    if not crm_tenant_id:
-        raise ValueError("crm_tenant_id cannot be empty.")
-
     clean_base_url = crm_base_url.strip().rstrip("/")
     phone_id = phone_number_id.strip() if phone_number_id else ""
 
     conn = get_db()
     conn.execute("""
-        INSERT INTO client_config (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at)
+        INSERT INTO client_config
+        (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(client_id) DO UPDATE SET
             client_name = excluded.client_name,
-            phone_number_id = excluded.phone_number_id,
+            phone_number_id = CASE
+                WHEN excluded.phone_number_id <> '' THEN excluded.phone_number_id
+                ELSE client_config.phone_number_id
+            END,
             crm_base_url = excluded.crm_base_url,
-            crm_tenant_id = excluded.crm_tenant_id,
+            crm_tenant_id = CASE
+                WHEN excluded.crm_tenant_id <> '' THEN excluded.crm_tenant_id
+                ELSE client_config.crm_tenant_id
+            END,
             updated_at = excluded.updated_at
     """, (client_id.strip(), client_name.strip(), phone_id, clean_base_url, crm_tenant_id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
     conn.commit()
@@ -1874,8 +1878,12 @@ async def dashboard_portal(client_id: str = "glaze-dental"):
             <input type="text" id="crmBaseUrl" value="{config['crm_base_url']}" placeholder="https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com" required>
         </div>
         <div class="form-group">
-            <label>Tenant ID (X-Tenant-Key)</label>
-            <input type="text" id="crmTenantId" value="{config['crm_tenant_id']}" placeholder="6b4b6128-5b5f-4d2f-b5de-91511ab9b120" required>
+            <label>WhatsApp Phone Number ID</label>
+            <input type="text" id="phoneNumberId" value="{config.get('phone_number_id', '')}" readonly style="background: #f1f5f9;">
+        </div>
+        <div class="form-group">
+            <label>CRM Tenant Key</label>
+            <input type="text" value="{('Configured server-side' if config.get('crm_tenant_id') else 'Not configured')}" readonly style="background: #f1f5f9;">
         </div>
         <div>
             <button type="submit" class="btn">Save CRM Configuration</button>
@@ -1900,7 +1908,7 @@ document.getElementById('crmForm').onsubmit = async (e) => {{
                 client_id: document.getElementById('clientId').value,
                 client_name: document.getElementById('clientName').value,
                 crm_base_url: document.getElementById('crmBaseUrl').value,
-                crm_tenant_id: document.getElementById('crmTenantId').value
+                phone_number_id: document.getElementById('phoneNumberId').value
             }})
         }});
         const data = await res.json();
@@ -1967,14 +1975,15 @@ async def save_client_config_api(request: Request):
         client_id = body.get("client_id", "glaze-dental")
         client_name = body.get("client_name", "Glaze Dental Clinic")
         crm_base_url = body.get("crm_base_url", "")
-        crm_tenant_id = body.get("crm_tenant_id", "")
         phone_number_id = body.get("phone_number_id", "")
 
+        # CRM credentials are server-side secrets. This endpoint never accepts
+        # or stores the actual tenant key.
         save_client_crm_config(
             client_id=client_id,
             client_name=client_name,
             crm_base_url=crm_base_url,
-            crm_tenant_id=crm_tenant_id,
+            crm_tenant_id="",
             phone_number_id=phone_number_id
         )
         return {"status": "success", "message": "CRM configuration saved successfully"}

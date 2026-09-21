@@ -1802,6 +1802,75 @@ async def whatsapp_webhook(request: Request):
 
 
 # ============================================================
+# TEMPORARY CRM CONNECTIVITY DIAGNOSTIC
+# ============================================================
+
+@app.get("/debug/crm-slots")
+async def debug_crm_slots():
+    """Diagnostic: verify Render -> CRM connectivity using normal TLS."""
+    client_id = "glaze-dental"
+    test_date = "2026-09-30"
+    config = get_client_crm_config(client_id)
+
+    if not config:
+        return JSONResponse({
+            "status": "error",
+            "step": "crm_config",
+            "message": "CRM configuration not found"
+        }, status_code=500)
+
+    crm_base_url = (config.get("crm_base_url") or "").rstrip("/")
+    tenant_key = config.get("crm_tenant_id") or ""
+    url = f"{crm_base_url}/api/v1/integrations/whatsapp/slots"
+
+    if not crm_base_url or not tenant_key:
+        return JSONResponse({
+            "status": "error",
+            "step": "crm_config",
+            "message": "CRM URL or tenant key is not configured"
+        }, status_code=500)
+
+    try:
+        response = requests.get(
+            url,
+            params={"date": test_date},
+            headers={"X-Tenant-Key": tenant_key},
+            timeout=20
+        )
+
+        try:
+            crm_response = response.json()
+        except ValueError:
+            crm_response = {"raw_response": response.text[:1000]}
+
+        return JSONResponse({
+            "status": "success" if response.ok else "error",
+            "render_to_crm_http_status": response.status_code,
+            "date_tested": test_date,
+            "crm_response": crm_response
+        }, status_code=200 if response.ok else 502)
+
+    except requests.exceptions.SSLError as exc:
+        logger.error("DEBUG CRM SSL ERROR | %s", exc)
+        return JSONResponse({
+            "status": "error",
+            "step": "render_to_crm_ssl",
+            "message": "Render could not verify the CRM TLS certificate.",
+            "error_type": type(exc).__name__,
+            "error": str(exc)
+        }, status_code=502)
+
+    except requests.exceptions.RequestException as exc:
+        logger.error("DEBUG CRM CONNECTION ERROR | %s", exc)
+        return JSONResponse({
+            "status": "error",
+            "step": "render_to_crm",
+            "error_type": type(exc).__name__,
+            "error": str(exc)
+        }, status_code=502)
+
+
+# ============================================================
 # HEALTH, DASHBOARD & MANAGEMENT ENDPOINTS
 # ============================================================
 
@@ -1998,31 +2067,3 @@ async def test_crm_connection_endpoint(client_id: str = "glaze-dental", test_dat
     slots = get_available_slots(client_id, test_date)
     if slots is not None:
         return {
-            "status": "success",
-            "message": "Connection successful",
-            "date_tested": test_date,
-            "available_slots_count": len(slots)
-        }
-    else:
-        return JSONResponse(
-            {
-                "status": "error",
-                "message": "Connection failed. Check CRM API URL and Tenant ID."
-            },
-            status_code=502
-        )
-
-
-@app.get("/api/appointments")
-@app.get("/api/v1/appointments")
-async def get_appointments_api(client_id: str = "glaze-dental", date: Optional[str] = None):
-    filters = {}
-    if date:
-        filters["date"] = date
-    res = get_appointments(client_id, filters)
-    if res.get("status") == "success":
-        return res.get("data", [])
-    return JSONResponse(
-        {"status": "error", "message": res.get("message", "Failed to retrieve appointments from CRM")},
-        status_code=res.get("status_code", 502)
-    )

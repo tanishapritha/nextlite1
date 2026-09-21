@@ -744,5 +744,7 @@ def test_20_security_credentials_and_logging(test_client):
     r_cfg = test_client.get("/api/client-config?client_id=glaze-dental")
     assert r_cfg.status_code == 200
     data = r_cfg.json()
-    assert "crm_tenant_id" in data
-    assert "META_WHATSAPP_TOKEN" not in json.dumps(data)
+    assert data["crm_tenant_configured"] is True
+    assert "crm_tenant_id" not in data
+    assert "GLAZE_CRM_TENANT_KEY" not in json.dumps(data)
+    assert "GLAZE_WHATSAPP_TOKEN" not in json.dumps(data)

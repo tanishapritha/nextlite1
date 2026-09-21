@@ -2,7 +2,6 @@
   "client_id": "glaze-dental",
   "client_name": "Glaze Dental Clinic",
   "crm_base_url": "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com",
-  "crm_tenant_id": "6b4b6128-5b5f-4d2f-b5de-91511ab9b120",
   "phone_number_id": "1208541249018781",
   "assistant_name": "Glaze Dental Clinic Assistant",
   "doctor": {

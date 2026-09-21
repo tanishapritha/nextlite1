@@ -4,6 +4,8 @@ import logging
 import sqlite3
 import datetime
 import asyncio
+import hashlib
+import hmac
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -27,11 +29,14 @@ app = FastAPI(title="Glaze Dental Clinic WhatsApp AI")
 # ============================================================
 
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "nextlite-demo")
-WHATSAPP_TOKEN = os.getenv("META_WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "1208541249018781")
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v26.0")
-REMINDER_TEMPLATE_NAME = os.getenv("META_REMINDER_TEMPLATE", "glaze_appointment_1h_reminder")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# Client A (Glaze) credentials are kept by us for now.
+# Only the environment-variable name is stored in the tenant configuration.
+GLAZE_WHATSAPP_TOKEN = os.getenv("GLAZE_WHATSAPP_TOKEN", "")
+GLAZE_CRM_TENANT_KEY = os.getenv("GLAZE_CRM_TENANT_KEY", "")
 
 DB_PATH = "nextlite.db"
 KNOWLEDGE_PATH = "nextlite.json"
@@ -183,7 +188,10 @@ def init_db():
             client_name TEXT NOT NULL,
             phone_number_id TEXT,
             crm_base_url TEXT NOT NULL,
-            crm_tenant_id TEXT NOT NULL,
+            crm_tenant_id TEXT NOT NULL DEFAULT '',
+            whatsapp_token_env TEXT NOT NULL DEFAULT '',
+            crm_tenant_key_env TEXT NOT NULL DEFAULT '',
+            reminder_template_name TEXT NOT NULL DEFAULT 'glaze_appointment_1h_reminder',
             updated_at TEXT NOT NULL
         )
     """)
@@ -191,12 +199,19 @@ def init_db():
     _existing_cfg_cols = {row[1] for row in cursor.execute("PRAGMA table_info(client_config)")}
     if "phone_number_id" not in _existing_cfg_cols:
         cursor.execute("ALTER TABLE client_config ADD COLUMN phone_number_id TEXT")
+    if "whatsapp_token_env" not in _existing_cfg_cols:
+        cursor.execute("ALTER TABLE client_config ADD COLUMN whatsapp_token_env TEXT NOT NULL DEFAULT ''")
+    if "crm_tenant_key_env" not in _existing_cfg_cols:
+        cursor.execute("ALTER TABLE client_config ADD COLUMN crm_tenant_key_env TEXT NOT NULL DEFAULT ''")
+    if "reminder_template_name" not in _existing_cfg_cols:
+        cursor.execute("ALTER TABLE client_config ADD COLUMN reminder_template_name TEXT NOT NULL DEFAULT 'glaze_appointment_1h_reminder'")
 
     # 2. Chats table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
+            client_id TEXT NOT NULL DEFAULT 'glaze-dental',
             direction TEXT NOT NULL,
             message TEXT,
             message_type TEXT,
@@ -206,6 +221,7 @@ def init_db():
 
     _existing_chats_cols = {row[1] for row in cursor.execute("PRAGMA table_info(chats)")}
     for _col, _def in [
+        ("client_id", "TEXT NOT NULL DEFAULT 'glaze-dental'"),
         ("direction", "TEXT NOT NULL DEFAULT 'inbound'"),
         ("message_type", "TEXT"),
     ]:
@@ -217,15 +233,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
+            client_id TEXT NOT NULL DEFAULT 'glaze-dental',
             action TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
 
     # 4. Conversations table
+    # A conversation is unique per (client_id, phone), not globally per phone.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
-            phone TEXT PRIMARY KEY,
+            phone TEXT NOT NULL,
             client_id TEXT NOT NULL DEFAULT 'glaze-dental',
             state TEXT NOT NULL DEFAULT 'IDLE',
             service TEXT,
@@ -233,13 +251,15 @@ def init_db():
             patient_type TEXT,
             appointment_date TEXT,
             appointment_time TEXT,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (client_id, phone)
         )
     """)
 
     _existing_conv_cols = {row[1] for row in cursor.execute("PRAGMA table_info(conversations)")}
+    if "client_id" not in _existing_conv_cols:
+        cursor.execute("ALTER TABLE conversations ADD COLUMN client_id TEXT NOT NULL DEFAULT 'glaze-dental'")
     for _col, _def in [
-        ("client_id", "TEXT NOT NULL DEFAULT 'glaze-dental'"),
         ("state", "TEXT NOT NULL DEFAULT 'IDLE'"),
         ("service", "TEXT"),
         ("patient_name", "TEXT"),
@@ -249,6 +269,33 @@ def init_db():
     ]:
         if _col not in _existing_conv_cols:
             cursor.execute(f"ALTER TABLE conversations ADD COLUMN {_col} {_def}")
+
+    # Existing deployments used phone as the sole primary key. Rebuild that
+    # table once so the primary key becomes (client_id, phone).
+    _conv_pk_cols = [row for row in cursor.execute("PRAGMA table_info(conversations)") if row[5] > 0]
+    if len(_conv_pk_cols) == 1 and _conv_pk_cols[0][1] == "phone":
+        cursor.execute("""
+            CREATE TABLE conversations_v2 (
+                phone TEXT NOT NULL,
+                client_id TEXT NOT NULL DEFAULT 'glaze-dental',
+                state TEXT NOT NULL DEFAULT 'IDLE',
+                service TEXT,
+                patient_name TEXT,
+                patient_type TEXT,
+                appointment_date TEXT,
+                appointment_time TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (client_id, phone)
+            )
+        """)
+        cursor.execute("""
+            INSERT OR IGNORE INTO conversations_v2
+            (phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, updated_at)
+            SELECT phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, updated_at
+            FROM conversations
+        """)
+        cursor.execute("DROP TABLE conversations")
+        cursor.execute("ALTER TABLE conversations_v2 RENAME TO conversations")
 
     # 5. Local Appointments table
     cursor.execute("""
@@ -306,20 +353,32 @@ def init_db():
     seed_client_id = KNOWLEDGE.get("client_id", "glaze-dental")
     seed_client_name = KNOWLEDGE.get("client_name", "Glaze Dental Clinic")
     seed_crm_base_url = KNOWLEDGE.get("crm_base_url", "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com").rstrip("/")
-    seed_crm_tenant_id = KNOWLEDGE.get("crm_tenant_id", "6b4b6128-5b5f-4d2f-b5de-91511ab9b120").strip()
-    seed_phone_number_id = KNOWLEDGE.get("phone_number_id", PHONE_NUMBER_ID)
+    seed_phone_number_id = KNOWLEDGE.get("phone_number_id", "").strip()
+    seed_whatsapp_token_env = "GLAZE_WHATSAPP_TOKEN"
+    seed_crm_tenant_key_env = "GLAZE_CRM_TENANT_KEY"
+    seed_template_name = os.getenv("META_REMINDER_TEMPLATE", "glaze_appointment_1h_reminder")
 
-    # Always upsert so that changes to nextlite.json take effect without wiping the DB.
+    # Secret values are NOT persisted in SQLite. The DB stores only the
+    # environment-variable names used to retrieve them at runtime.
     cursor.execute("""
-        INSERT INTO client_config (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO client_config
+        (client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id,
+         whatsapp_token_env, crm_tenant_key_env, reminder_template_name, updated_at)
+        VALUES (?, ?, ?, ?, '', ?, ?, ?, ?)
         ON CONFLICT(client_id) DO UPDATE SET
             crm_base_url = excluded.crm_base_url,
-            crm_tenant_id = excluded.crm_tenant_id,
             client_name = excluded.client_name,
             phone_number_id = excluded.phone_number_id,
+            crm_tenant_id = '',
+            whatsapp_token_env = excluded.whatsapp_token_env,
+            crm_tenant_key_env = excluded.crm_tenant_key_env,
+            reminder_template_name = excluded.reminder_template_name,
             updated_at = excluded.updated_at
-    """, (seed_client_id, seed_client_name, seed_phone_number_id, seed_crm_base_url, seed_crm_tenant_id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
+    """, (
+        seed_client_id, seed_client_name, seed_phone_number_id,
+        seed_crm_base_url, seed_whatsapp_token_env, seed_crm_tenant_key_env,
+        seed_template_name, datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ))
     logger.info("Upserted CRM configuration for client: %s | base_url: %s", seed_client_id, seed_crm_base_url)
 
     conn.commit()
@@ -342,34 +401,44 @@ def startup():
 def get_client_crm_config(client_id: str) -> Optional[Dict[str, Any]]:
     conn = get_db()
     row = conn.execute(
-        "SELECT client_id, client_name, phone_number_id, crm_base_url, crm_tenant_id, updated_at FROM client_config WHERE client_id = ?",
+        """SELECT client_id, client_name, phone_number_id, crm_base_url,
+                  crm_tenant_id, whatsapp_token_env, crm_tenant_key_env,
+                  reminder_template_name, updated_at
+           FROM client_config WHERE client_id = ?""",
         (client_id,)
     ).fetchone()
     conn.close()
 
     if row:
-        return dict(row)
+        config = dict(row)
+        env_name = config.get("crm_tenant_key_env") or ""
+        if env_name:
+            config["crm_tenant_id"] = os.getenv(env_name, "")
+        return config
 
     if client_id == KNOWLEDGE.get("client_id", "glaze-dental"):
         return {
             "client_id": client_id,
             "client_name": KNOWLEDGE.get("client_name", "Glaze Dental Clinic"),
-            "phone_number_id": KNOWLEDGE.get("phone_number_id", PHONE_NUMBER_ID),
+            "phone_number_id": KNOWLEDGE.get("phone_number_id", "").strip(),
             "crm_base_url": KNOWLEDGE.get("crm_base_url", "").rstrip("/"),
-            "crm_tenant_id": KNOWLEDGE.get("crm_tenant_id", "").strip(),
+            "crm_tenant_id": GLAZE_CRM_TENANT_KEY,
+            "whatsapp_token_env": "GLAZE_WHATSAPP_TOKEN",
+            "crm_tenant_key_env": "GLAZE_CRM_TENANT_KEY",
+            "reminder_template_name": os.getenv("META_REMINDER_TEMPLATE", "glaze_appointment_1h_reminder"),
             "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
 
     return None
 
 
-def resolve_client_by_phone_number_id(receiving_phone_number_id: Optional[str]) -> str:
+def resolve_client_by_phone_number_id(receiving_phone_number_id: Optional[str]) -> Optional[str]:
     """
-    Identifies tenant client_id using the receiving Meta phone_number_id.
-    Patient cannot control or specify tenant ID or key.
+    Identifies tenant client_id strictly from Meta's phone_number_id.
+    Unknown/missing phone numbers are rejected instead of falling back to a tenant.
     """
     if not receiving_phone_number_id:
-        return "glaze-dental"
+        return None
 
     conn = get_db()
     row = conn.execute(
@@ -378,13 +447,29 @@ def resolve_client_by_phone_number_id(receiving_phone_number_id: Optional[str]) 
     ).fetchone()
     conn.close()
 
-    if row and row["client_id"]:
-        return row["client_id"]
+    return row["client_id"] if row and row["client_id"] else None
 
-    if receiving_phone_number_id == PHONE_NUMBER_ID:
-        return "glaze-dental"
 
-    return "glaze-dental"
+def get_client_whatsapp_config(client_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_db()
+    row = conn.execute(
+        """SELECT client_id, phone_number_id, whatsapp_token_env,
+                  reminder_template_name
+           FROM client_config WHERE client_id = ?""",
+        (client_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    config = dict(row)
+    env_name = config.get("whatsapp_token_env") or ""
+    token = os.getenv(env_name, "") if env_name else ""
+    if client_id == "glaze-dental" and not token:
+        token = GLAZE_WHATSAPP_TOKEN
+    config["whatsapp_token"] = token
+    return config
 
 
 def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, crm_tenant_id: str, phone_number_id: Optional[str] = None) -> bool:
@@ -397,7 +482,7 @@ def save_client_crm_config(client_id: str, client_name: str, crm_base_url: str, 
         raise ValueError("crm_tenant_id cannot be empty.")
 
     clean_base_url = crm_base_url.strip().rstrip("/")
-    phone_id = phone_number_id.strip() if phone_number_id else PHONE_NUMBER_ID
+    phone_id = phone_number_id.strip() if phone_number_id else ""
 
     conn = get_db()
     conn.execute("""
@@ -643,19 +728,29 @@ def get_appointments(client_id: str, filters: Optional[Dict[str, Any]] = None) -
 
 class MetaCloudProvider:
     @staticmethod
-    def _send_payload(payload: Dict[str, Any]) -> bool:
-        if not WHATSAPP_TOKEN:
-            logger.error("META_WHATSAPP_TOKEN is missing")
+    def _send_payload(payload: Dict[str, Any], client_id: Optional[str] = None) -> bool:
+        if not client_id:
+            client_id = "glaze-dental"
+
+        whatsapp_config = get_client_whatsapp_config(client_id)
+        if not whatsapp_config:
+            logger.error("WHATSAPP CONFIG MISSING | client=%s", client_id)
             return False
 
-        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+        token = whatsapp_config.get("whatsapp_token", "")
+        phone_number_id = whatsapp_config.get("phone_number_id", "")
+        if not token or not phone_number_id:
+            logger.error("WHATSAPP CREDENTIALS MISSING | client=%s", client_id)
+            return False
+
+        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{phone_number_id}/messages"
         headers = {
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
 
         try:
-            logger.info("WHATSAPP OUTBOUND | URL=%s | TO=%s", url, payload.get("to"))
+            logger.info("WHATSAPP OUTBOUND | client=%s | TO=%s", client_id, payload.get("to"))
             response = requests.post(url, headers=headers, json=payload, timeout=15)
             logger.info("WHATSAPP RESPONSE | STATUS=%s | BODY=%s", response.status_code, response.text[:500])
             response.raise_for_status()
@@ -665,20 +760,20 @@ class MetaCloudProvider:
             return False
 
     @classmethod
-    def send_text(cls, phone: str, text: str) -> bool:
+    def send_text(cls, phone: str, text: str, client_id: Optional[str] = None) -> bool:
         payload = {
             "messaging_product": "whatsapp",
             "to": phone,
             "type": "text",
             "text": {"preview_url": False, "body": text}
         }
-        success = _send_payload(payload)
+        success = _send_payload(payload, client_id=client_id)
         if success:
-            log_chat(phone, "outgoing", text, "text")
+            log_chat(phone, "outgoing", text, "text", client_id=client_id)
         return success
 
     @classmethod
-    def send_button(cls, phone: str, body: str, buttons: List[Dict[str, str]]) -> bool:
+    def send_button(cls, phone: str, body: str, buttons: List[Dict[str, str]], client_id: Optional[str] = None) -> bool:
         buttons = buttons[:3]
         payload = {
             "messaging_product": "whatsapp",
@@ -698,13 +793,13 @@ class MetaCloudProvider:
                 }
             }
         }
-        success = _send_payload(payload)
+        success = _send_payload(payload, client_id=client_id)
         if success:
-            log_chat(phone, "outgoing", body, "interactive_button")
+            log_chat(phone, "outgoing", body, "interactive_button", client_id=client_id)
         return success
 
     @classmethod
-    def send_list(cls, phone: str, body: str, button_text: str, rows: List[Dict[str, str]]) -> bool:
+    def send_list(cls, phone: str, body: str, button_text: str, rows: List[Dict[str, str]], client_id: Optional[str] = None) -> bool:
         rows = rows[:10]
         payload = {
             "messaging_product": "whatsapp",
@@ -731,13 +826,13 @@ class MetaCloudProvider:
                 }
             }
         }
-        success = _send_payload(payload)
+        success = _send_payload(payload, client_id=client_id)
         if success:
-            log_chat(phone, "outgoing", body, "interactive_list")
+            log_chat(phone, "outgoing", body, "interactive_list", client_id=client_id)
         return success
 
     @classmethod
-    def send_template(cls, phone: str, template_name: str, language_code: str = "en", components: List[Any] = None) -> bool:
+    def send_template(cls, phone: str, template_name: str, language_code: str = "en", components: List[Any] = None, client_id: Optional[str] = None) -> bool:
         payload = {
             "messaging_product": "whatsapp",
             "to": phone,
@@ -748,30 +843,39 @@ class MetaCloudProvider:
                 "components": components or []
             }
         }
-        success = _send_payload(payload)
+        success = _send_payload(payload, client_id=client_id)
         if success:
-            log_chat(phone, "outgoing", f"[Template: {template_name}]", "template")
+            log_chat(phone, "outgoing", f"[Template: {template_name}]", "template", client_id=client_id)
         return success
 
 
-def _send_payload(payload: Dict[str, Any]) -> bool:
-    return MetaCloudProvider._send_payload(payload)
+def _send_payload(payload: Dict[str, Any], client_id: Optional[str] = None) -> bool:
+    return MetaCloudProvider._send_payload(payload, client_id=client_id)
 
 
-def send_text_message(phone: str, text: str) -> bool:
-    return MetaCloudProvider.send_text(phone, text)
+def _client_id_for_phone(phone: str) -> str:
+    conversation = get_conversation(phone)
+    return conversation.get("client_id", "glaze-dental")
 
 
-def send_button_message(phone: str, body: str, buttons: List[Dict[str, str]]) -> bool:
-    return MetaCloudProvider.send_button(phone, body, buttons)
+def send_text_message(phone: str, text: str, client_id: Optional[str] = None) -> bool:
+    client_id = client_id or _client_id_for_phone(phone)
+    return MetaCloudProvider.send_text(phone, text, client_id=client_id)
 
 
-def send_list_message(phone: str, body: str, button_text: str, rows: List[Dict[str, str]]) -> bool:
-    return MetaCloudProvider.send_list(phone, body, button_text, rows)
+def send_button_message(phone: str, body: str, buttons: List[Dict[str, str]], client_id: Optional[str] = None) -> bool:
+    client_id = client_id or _client_id_for_phone(phone)
+    return MetaCloudProvider.send_button(phone, body, buttons, client_id=client_id)
 
 
-def send_template_message(phone: str, template_name: str, language_code: str = "en", components: List[Any] = None) -> bool:
-    return MetaCloudProvider.send_template(phone, template_name, language_code, components)
+def send_list_message(phone: str, body: str, button_text: str, rows: List[Dict[str, str]], client_id: Optional[str] = None) -> bool:
+    client_id = client_id or _client_id_for_phone(phone)
+    return MetaCloudProvider.send_list(phone, body, button_text, rows, client_id=client_id)
+
+
+def send_template_message(phone: str, template_name: str, language_code: str = "en", components: List[Any] = None, client_id: Optional[str] = None) -> bool:
+    client_id = client_id or _client_id_for_phone(phone)
+    return MetaCloudProvider.send_template(phone, template_name, language_code, components, client_id=client_id)
 
 
 # ============================================================
@@ -786,12 +890,13 @@ def clinic_name() -> str:
     return KNOWLEDGE.get("client_name", "Glaze Dental Clinic")
 
 
-def log_chat(phone: str, direction: str, message: str, message_type: str = "text"):
+def log_chat(phone: str, direction: str, message: str, message_type: str = "text", client_id: Optional[str] = None):
     try:
+        client_id = client_id or _client_id_for_phone(phone)
         conn = get_db()
         conn.execute(
-            "INSERT INTO chats (phone, direction, message, message_type, created_at) VALUES (?, ?, ?, ?, ?)",
-            (phone, direction, message, message_type, now_iso())
+            "INSERT INTO chats (phone, client_id, direction, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (phone, client_id, direction, message, message_type, now_iso())
         )
         conn.commit()
         conn.close()
@@ -799,25 +904,35 @@ def log_chat(phone: str, direction: str, message: str, message_type: str = "text
         logger.error("Chat logging failed | %s: %s", type(exc).__name__, exc)
 
 
-def log_action(phone: str, action: str):
+def log_action(phone: str, action: str, client_id: Optional[str] = None):
     try:
+        client_id = client_id or _client_id_for_phone(phone)
         conn = get_db()
-        conn.execute("INSERT INTO actions (phone, action, created_at) VALUES (?, ?, ?)", (phone, action, now_iso()))
+        conn.execute("INSERT INTO actions (phone, client_id, action, created_at) VALUES (?, ?, ?, ?)", (phone, client_id, action, now_iso()))
         conn.commit()
         conn.close()
     except Exception as exc:
         logger.error("Action logging failed | %s: %s", type(exc).__name__, exc)
 
 
-def get_conversation(phone: str) -> Dict[str, Any]:
+def get_conversation(phone: str, client_id: Optional[str] = None) -> Dict[str, Any]:
     conn = get_db()
-    row = conn.execute("SELECT * FROM conversations WHERE phone = ?", (phone,)).fetchone()
+    if client_id:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE client_id = ? AND phone = ?",
+            (client_id, phone)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE phone = ? ORDER BY updated_at DESC LIMIT 1",
+            (phone,)
+        ).fetchone()
     conn.close()
 
     if not row:
         return {
             "phone": phone,
-            "client_id": "glaze-dental",
+            "client_id": client_id or "glaze-dental",
             "state": "IDLE",
             "service": None,
             "patient_name": None,
@@ -838,7 +953,7 @@ def update_conversation(
     appointment_date: Optional[str] = None,
     appointment_time: Optional[str] = None
 ):
-    current = get_conversation(phone)
+    current = get_conversation(phone, client_id=client_id)
     client_id = client_id if client_id is not None else current["client_id"]
     state = state if state is not None else current["state"]
     service = service if service is not None else current["service"]
@@ -852,7 +967,7 @@ def update_conversation(
         INSERT INTO conversations
         (phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(phone) DO UPDATE SET
+        ON CONFLICT(client_id, phone) DO UPDATE SET
             client_id = excluded.client_id,
             state = excluded.state,
             service = excluded.service,
@@ -1005,25 +1120,29 @@ def process_due_reminders() -> int:
             pass
 
         # Send reminder via WhatsApp template (or fallback text)
+        tenant_config = get_client_crm_config(client_id) or {}
+        tenant_name = tenant_config.get("client_name") or clinic_name()
+        template_name = tenant_config.get("reminder_template_name") or os.getenv("META_REMINDER_TEMPLATE", "glaze_appointment_1h_reminder")
         msg_text = (
-            f"⏰ Reminder: You have an upcoming appointment at {clinic_name()} in 1 hour. "
-            "Please reach the clinic on time. Call 9822977740 if you need directions."
+            f"⏰ Reminder: You have an upcoming appointment at {tenant_name} in 1 hour. "
+            "Please reach the clinic on time."
         )
 
         template_sent = send_template_message(
             phone=phone,
-            template_name=REMINDER_TEMPLATE_NAME,
+            template_name=template_name,
             language_code="en",
             components=[
                 {
                     "type": "body",
                     "parameters": [{"type": "text", "text": clinic_name()}]
                 }
-            ]
+            ],
+            client_id=client_id
         )
 
         # Fallback to direct text message if template failed or in test environment
-        success = template_sent or send_text_message(phone, msg_text)
+        success = template_sent or send_text_message(phone, msg_text, client_id=client_id)
 
         conn_fin = get_db()
         if success:
@@ -1196,10 +1315,10 @@ Customer question:
 # DETERMINISTIC BOOKING STATE MACHINE
 # ============================================================
 
-def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optional[str] = None):
-    conversation = get_conversation(phone)
+def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optional[str] = None, client_id: Optional[str] = None):
+    conversation = get_conversation(phone, client_id=client_id)
+    client_id = client_id or conversation.get("client_id", "glaze-dental")
     current_state = conversation.get("state", "IDLE")
-    client_id = conversation.get("client_id", "glaze-dental")
     normalized = text.strip().lower()
 
     logger.info(
@@ -1207,9 +1326,9 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         phone, client_id, msg_type, current_state, action_id, text
     )
 
-    log_chat(phone, "incoming", text, msg_type)
+    log_chat(phone, "incoming", text, msg_type, client_id=client_id)
     if action_id:
-        log_action(phone, action_id)
+        log_action(phone, action_id, client_id=client_id)
 
     # --------------------------------------------------------
     # 1. EMERGENCY CHECK (Highest Priority)
@@ -1573,6 +1692,19 @@ async def whatsapp_webhook(request: Request):
     if not raw_body:
         return JSONResponse({"status": "invalid_json", "reason": "empty_body"}, status_code=200)
 
+    # Meta signs the exact raw POST body with the app secret.
+    # Keep this disabled only for local tests/dev when META_APP_SECRET is unset.
+    if META_APP_SECRET:
+        received_signature = request.headers.get("x-hub-signature-256", "")
+        expected_signature = "sha256=" + hmac.new(
+            META_APP_SECRET.encode("utf-8"),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+        if not received_signature or not hmac.compare_digest(received_signature, expected_signature):
+            logger.warning("WEBHOOK SIGNATURE VERIFICATION FAILED")
+            return JSONResponse({"status": "invalid_signature"}, status_code=401)
+
     try:
         body = json.loads(raw_body.decode("utf-8"))
     except Exception as exc:
@@ -1597,6 +1729,9 @@ async def whatsapp_webhook(request: Request):
 
             # Resolve tenant client_id strictly from Meta connection (NOT from patient payload)
             resolved_client_id = resolve_client_by_phone_number_id(receiving_phone_number_id)
+            if not resolved_client_id:
+                logger.warning("WEBHOOK TENANT NOT FOUND | phone_number_id=%s", receiving_phone_number_id)
+                continue
 
             for message in messages:
                 msg_id = message.get("id")
@@ -1637,7 +1772,7 @@ async def whatsapp_webhook(request: Request):
                 else:
                     # Gracefully handle unsupported message types (e.g. image, audio, sticker)
                     logger.info("UNSUPPORTED MESSAGE TYPE | sender=%s | type=%s", sender, msg_type)
-                    send_text_message(sender, "Thank you for reaching out! I can assist with text messages for booking appointments, services, and clinic details.")
+                    send_text_message(sender, "Thank you for reaching out! I can assist with text messages for booking appointments, services, and clinic details.", client_id=resolved_client_id)
                     processed += 1
                     continue
 
@@ -1649,13 +1784,14 @@ async def whatsapp_webhook(request: Request):
                         phone=sender,
                         msg_type=msg_type,
                         text=text_content,
-                        action_id=action_id
+                        action_id=action_id,
+                        client_id=resolved_client_id
                     )
                     processed += 1
                 except Exception as exc:
                     logger.error("MESSAGE HANDLER ERROR | USER=%s | %s: %s", sender, type(exc).__name__, exc, exc_info=True)
                     try:
-                        send_text_message(sender, "Sorry, something went wrong. Please try again or call 9822977740.")
+                        send_text_message(sender, "Sorry, something went wrong. Please try again or call 9822977740.", client_id=resolved_client_id)
                     except Exception:
                         pass
 
@@ -1818,8 +1954,10 @@ async def get_client_config_api(client_id: str = "glaze-dental"):
     return {
         "client_id": config["client_id"],
         "client_name": config["client_name"],
+        "phone_number_id": config.get("phone_number_id"),
         "crm_base_url": config["crm_base_url"],
-        "crm_tenant_id": config["crm_tenant_id"]
+        "crm_tenant_configured": bool(config.get("crm_tenant_id")),
+        "whatsapp_configured": bool((get_client_whatsapp_config(client_id) or {}).get("whatsapp_token"))
     }
 
 
@@ -1831,12 +1969,14 @@ async def save_client_config_api(request: Request):
         client_name = body.get("client_name", "Glaze Dental Clinic")
         crm_base_url = body.get("crm_base_url", "")
         crm_tenant_id = body.get("crm_tenant_id", "")
+        phone_number_id = body.get("phone_number_id", "")
 
         save_client_crm_config(
             client_id=client_id,
             client_name=client_name,
             crm_base_url=crm_base_url,
-            crm_tenant_id=crm_tenant_id
+            crm_tenant_id=crm_tenant_id,
+            phone_number_id=phone_number_id
         )
         return {"status": "success", "message": "CRM configuration saved successfully"}
     except ValueError as val_err:

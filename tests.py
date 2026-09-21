@@ -9,14 +9,15 @@ from fastapi.testclient import TestClient
 # Set environment variables for testing environment
 os.environ["META_VERIFY_TOKEN"] = "nextlite-demo"
 os.environ["META_GRAPH_API_VERSION"] = "v26.0"
-os.environ["META_PHONE_NUMBER_ID"] = "1208541249018781"
+os.environ["GLAZE_WHATSAPP_TOKEN"] = "glaze-test-whatsapp-token"
+os.environ["GLAZE_CRM_TENANT_KEY"] = "glaze-test-crm-tenant-key"
 
 import app
 
 sent_messages = []
 
 
-def mock_send_payload(payload):
+def mock_send_payload(payload, client_id=None):
     sent_messages.append(payload)
     return True
 
@@ -422,7 +423,7 @@ def test_11_crm_success_whatsapp_failure_protection(monkeypatch):
 
     monkeypatch.setattr(app, "book_appointment", mock_book)
     monkeypatch.setattr(app.CRMClient, "book_appointment", mock_book)
-    monkeypatch.setattr(app, "_send_payload", lambda p: False)
+    monkeypatch.setattr(app, "_send_payload", lambda p, client_id=None: False)
 
     app.reset_conversation(TEST_PHONE)
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
@@ -487,6 +488,23 @@ def test_13_tenant_isolation_multi_client(monkeypatch):
     app.save_client_crm_config("client-a", "Client A", "https://crm-a.example", "tenant-key-A", phone_number_id="phone_A")
     app.save_client_crm_config("client-b", "Client B", "https://crm-b.example", "tenant-key-B", phone_number_id="phone_B")
 
+    conn = app.get_db()
+    conn.execute(
+        "UPDATE client_config SET whatsapp_token_env = ?, crm_tenant_key_env = ? WHERE client_id = ?",
+        ("CLIENT_A_WHATSAPP_TOKEN", "CLIENT_A_CRM_KEY", "client-a")
+    )
+    conn.execute(
+        "UPDATE client_config SET whatsapp_token_env = ?, crm_tenant_key_env = ? WHERE client_id = ?",
+        ("CLIENT_B_WHATSAPP_TOKEN", "CLIENT_B_CRM_KEY", "client-b")
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("CLIENT_A_WHATSAPP_TOKEN", "token-A")
+    monkeypatch.setenv("CLIENT_B_WHATSAPP_TOKEN", "token-B")
+    monkeypatch.setenv("CLIENT_A_CRM_KEY", "crm-key-A")
+    monkeypatch.setenv("CLIENT_B_CRM_KEY", "crm-key-B")
+
     captured_requests = []
 
     def mock_get(url, params=None, headers=None, timeout=15):
@@ -499,17 +517,74 @@ def test_13_tenant_isolation_multi_client(monkeypatch):
 
     monkeypatch.setattr(app.requests, "get", mock_get)
 
-    # Client A slots call
     app.CRMClient.get_available_slots("client-a", "2026-09-21")
-    # Client B slots call
     app.CRMClient.get_available_slots("client-b", "2026-09-21")
 
-    assert len(captured_requests) == 2
     assert "https://crm-a.example" in captured_requests[0]["url"]
-    assert captured_requests[0]["headers"]["X-Tenant-Key"] == "tenant-key-A"
-
+    assert captured_requests[0]["headers"]["X-Tenant-Key"] == "crm-key-A"
     assert "https://crm-b.example" in captured_requests[1]["url"]
-    assert captured_requests[1]["headers"]["X-Tenant-Key"] == "tenant-key-B"
+    assert captured_requests[1]["headers"]["X-Tenant-Key"] == "crm-key-B"
+
+    calls = []
+    def capture_post(url, headers=None, json=None, timeout=15):
+        calls.append({"url": url, "headers": headers})
+        return type("R", (), {"status_code": 200, "text": "{}", "raise_for_status": lambda self: None})()
+    monkeypatch.setattr(app.requests, "post", capture_post)
+
+    assert app.MetaCloudProvider._send_payload({"to": "111"}, client_id="client-a") is True
+    assert app.MetaCloudProvider._send_payload({"to": "222"}, client_id="client-b") is True
+    assert "phone_A" in calls[0]["url"]
+    assert calls[0]["headers"]["Authorization"] == "Bearer token-A"
+    assert "phone_B" in calls[1]["url"]
+    assert calls[1]["headers"]["Authorization"] == "Bearer token-B"
+
+    # The same customer phone can have independent conversation state per tenant.
+    app.update_conversation("+919000000000", client_id="client-a", state="BOOKING_NAME")
+    app.update_conversation("+919000000000", client_id="client-b", state="BOOKING_DATE")
+    assert app.get_conversation("+919000000000", "client-a")["state"] == "BOOKING_NAME"
+    assert app.get_conversation("+919000000000", "client-b")["state"] == "BOOKING_DATE"
+
+
+def test_14_webhook_rejects_unknown_tenant(test_client):
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{"changes": [{"value": {
+            "metadata": {"phone_number_id": "unknown-phone-id"},
+            "messages": [{
+                "id": "wamid.UNKNOWN1",
+                "from": TEST_PHONE,
+                "type": "text",
+                "text": {"body": "hi"}
+            }]
+        }}]}]
+    }
+    r = test_client.post("/webhook", json=payload)
+    assert r.status_code == 200
+    assert r.json()["processed"] == 0
+    assert len(sent_messages) == 0
+
+
+def test_15_webhook_signature_verification(test_client, monkeypatch):
+    import hashlib
+    import hmac
+
+    monkeypatch.setattr(app, "META_APP_SECRET", "test-app-secret")
+    raw = b'{"object":"whatsapp_business_account","entry":[]}'
+    signature = "sha256=" + hmac.new(b"test-app-secret", raw, hashlib.sha256).hexdigest()
+
+    ok = test_client.post(
+        "/webhook",
+        content=raw,
+        headers={"content-type": "application/json", "x-hub-signature-256": signature}
+    )
+    assert ok.status_code == 200
+
+    bad = test_client.post(
+        "/webhook",
+        content=raw,
+        headers={"content-type": "application/json", "x-hub-signature-256": "sha256=bad"}
+    )
+    assert bad.status_code == 401
 
 
 # ============================================================

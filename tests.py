@@ -247,8 +247,7 @@ def test_06_crm_booking_201_success(monkeypatch):
 
     assert res["status"] == "success"
     assert res["data"]["appointmentId"] == "CRM-201-OK"
-    assert len(captured_posts) == 1
-    assert "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com/api/v1/integrations/whatsapp/appointments/book" in captured_posts[0]["url"]
+    assert len(captured_posts) == 1    assert "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com/api/v1/integrations/whatsapp/appointments/book" in captured_posts[0]["url"]
     assert captured_posts[0]["headers"]["X-Tenant-Key"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120"
 
     payload = captured_posts[0]["json"]
@@ -497,8 +496,7 @@ def test_13_tenant_isolation_multi_client(monkeypatch):
         "UPDATE client_config SET whatsapp_token_env = ?, crm_tenant_key_env = ? WHERE client_id = ?",
         ("CLIENT_B_WHATSAPP_TOKEN", "CLIENT_B_CRM_KEY", "client-b")
     )
-    conn.commit()
-    conn.close()
+    conn.commit()    conn.close()
 
     monkeypatch.setenv("CLIENT_A_WHATSAPP_TOKEN", "token-A")
     monkeypatch.setenv("CLIENT_B_WHATSAPP_TOKEN", "token-B")
@@ -748,7 +746,6 @@ def test_19_services_selection_continues_to_booking_date(monkeypatch):
     assert len(sent_messages) == 1
     assert "When would you like your appointment?" in sent_messages[0]["interactive"]["body"]["text"]
 
-
 # ============================================================
 # 20. SERVICE-FIRST FLOW COLLECTS DATE, TIME, NAME, PATIENT TYPE
 # ============================================================
@@ -824,3 +821,65 @@ def test_22_cancel_has_single_outbound_no_welcome_loop():
     body = sent_messages[0]["text"]["body"]
     assert "cancelled" in body.lower()
     assert "Welcome to Glaze" not in body
+
+# ============================================================
+# 23. BOOKING COLLECTS AGE AND PASSES META SENDER PHONE TO CRM
+# ============================================================
+def test_23_booking_collects_age_and_sender_phone(monkeypatch):
+    app.reset_conversation(TEST_PHONE)
+    sent_messages.clear()
+
+    captured = {}
+
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM"])
+
+    def mock_book(**kw):
+        captured.update(kw)
+        return {"status": "success", "data": {"appointmentId": "APT-AGE-1"}}
+
+    monkeypatch.setattr(app, "book_appointment", mock_book)
+    monkeypatch.setattr(app.CRMClient, "book_appointment", mock_book)
+
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_NAME"
+
+    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_AGE"
+
+    app.handle_user_message(TEST_PHONE, "text", "24")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_PATIENT_TYPE"
+
+    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
+
+    # Service-first flow now needs date/time after patient details.
+    today = datetime.date.today()
+    if today.weekday() == 6:
+        today = today + datetime.timedelta(days=1)
+    app.handle_user_message(TEST_PHONE, "interactive", "Today", action_id=f"date_{today.isoformat()}")
+    app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_CONFIRMATION"
+
+    app.handle_user_message(TEST_PHONE, "interactive", "Confirm", action_id="confirm_booking")
+
+    assert captured["customerName"] == "Rahul Sharma"
+    assert captured["customerPhone"] == TEST_PHONE
+    assert captured["age"] == "24"
+
+
+# ============================================================
+# 24. INVALID AGE IS REJECTED
+# ============================================================
+def test_24_invalid_age_rejected():
+    app.reset_conversation(TEST_PHONE)
+    sent_messages.clear()
+
+    app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "text", "abc")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_AGE"
+    assert "age" in sent_messages[0]["text"]["body"].lower()

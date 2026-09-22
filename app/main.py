@@ -987,9 +987,10 @@ def update_conversation(
     conn.close()
 
 
-def reset_conversation(phone: str):
+def reset_conversation(phone: str, client_id: Optional[str] = None):
     update_conversation(
         phone=phone,
+        client_id=client_id,
         state="IDLE",
         service=None,
         patient_name=None,
@@ -1340,7 +1341,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     # 1. EMERGENCY CHECK (Highest Priority)
     # --------------------------------------------------------
     if is_emergency(text):
-        reset_conversation(phone)
+        reset_conversation(phone, client_id=client_id)
         emergency_msg = (
             "🚨 This may require urgent attention. Please call Glaze Dental Clinic at 9822977740 "
             "immediately for emergency assistance."
@@ -1352,17 +1353,23 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     # 2. GLOBAL RESET / CANCEL
     # --------------------------------------------------------
     if normalized in {"cancel", "restart", "reset", "menu", "main menu"} or action_id in {"cancel_booking", "btn_cancel"}:
-        reset_conversation(phone)
-        if normalized in {"cancel", "restart", "reset"} or action_id in {"cancel_booking", "btn_cancel"}:
+        reset_conversation(phone, client_id=client_id)
+
+        if normalized == "cancel" or action_id in {"cancel_booking", "btn_cancel"}:
             send_text_message(phone, "Your booking process has been cancelled. Let us know whenever you'd like to book or ask a question.")
-        return main_menu(phone)
+            return
+
+        if normalized in {"restart", "reset", "menu", "main menu"}:
+            return main_menu(phone)
+
+        return
 
     # --------------------------------------------------------
     # 3. GREETINGS
     # --------------------------------------------------------
     greetings = {"hi", "hii", "hiii", "hello", "hey", "hey there", "good morning", "good afternoon", "good evening"}
     if normalized in greetings and current_state == "IDLE":
-        reset_conversation(phone)
+        reset_conversation(phone, client_id=client_id)
         return main_menu(phone)
 
     # --------------------------------------------------------
@@ -1648,7 +1655,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                 )
 
                 # Reset state & Send confirmation
-                reset_conversation(phone)
+                reset_conversation(phone, client_id=client_id)
 
                 confirmation_msg = (
                     f"✅ Your appointment has been confirmed at {clinic_name()}.\n\n"
@@ -1689,7 +1696,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                 return
 
         elif action_id in {"cancel_booking", "btn_cancel"} or normalized in {"cancel", "no"}:
-            reset_conversation(phone)
+            reset_conversation(phone, client_id=client_id)
             send_text_message(phone, "Your appointment booking has been cancelled.")
             return
 

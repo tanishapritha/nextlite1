@@ -1435,9 +1435,9 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             send_text_message(phone, "Please choose one of the available dental services below:")
             return send_booking_services(phone)
 
-        update_conversation(phone, state="BOOKING_DATE", service=service)
-        send_text_message(phone, f"You selected: *{service}*.")
-        return send_date_options(phone)
+        update_conversation(phone, state="BOOKING_NAME", service=service)
+        send_text_message(phone, f"You selected: *{service}*.\n\nPlease provide the patient's *full name*:")
+        return
 
     # --------------------------------------------------------
     # 7. BOOKING_NAME
@@ -1466,8 +1466,8 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             return send_patient_type_options(phone)
 
         latest = get_conversation(phone, client_id=client_id)
-        update_conversation(phone, state="BOOKING_CONFIRMATION", patient_type=patient_type)
         if latest.get("appointment_date") and latest.get("appointment_time"):
+            update_conversation(phone, state="BOOKING_CONFIRMATION", patient_type=patient_type)
             latest = get_conversation(phone, client_id=client_id)
             summary = (
                 "Please confirm your appointment:\n\n"
@@ -1482,6 +1482,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                 {"id": "confirm_booking", "title": "Confirm"},
                 {"id": "cancel_booking", "title": "Cancel"}
             ])
+        update_conversation(phone, state="BOOKING_DATE", patient_type=patient_type)
         return send_date_options(phone)
 
     # --------------------------------------------------------
@@ -2013,43 +2014,3 @@ async def get_client_config_api(client_id: str = "glaze-dental"):
 async def save_client_config_api(request: Request):
     try:
         body = await request.json()
-        client_id = body.get("client_id", "glaze-dental")
-        client_name = body.get("client_name", "Glaze Dental Clinic")
-        crm_base_url = body.get("crm_base_url", "")
-        phone_number_id = body.get("phone_number_id", "")
-
-        # CRM credentials are server-side secrets. This endpoint never accepts
-        # or stores the actual tenant key.
-        save_client_crm_config(
-            client_id=client_id,
-            client_name=client_name,
-            crm_base_url=crm_base_url,
-            crm_tenant_id="",
-            phone_number_id=phone_number_id
-        )
-        return {"status": "success", "message": "CRM configuration saved successfully"}
-    except ValueError as val_err:
-        return JSONResponse({"status": "error", "message": str(val_err)}, status_code=400)
-    except Exception as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
-
-
-@app.get("/api/test-crm-connection")
-async def test_crm_connection_endpoint(client_id: str = "glaze-dental", test_date: str = "2026-09-16"):
-    slots = get_available_slots(client_id, test_date)
-    if slots is not None:
-        return {
-            "status": "success",
-            "message": "Connection successful",
-            "date_tested": test_date,
-            "available_slots_count": len(slots)
-        }
-    else:
-        return JSONResponse(
-            {
-                "status": "error",
-                "message": "Connection failed. Check CRM API URL and Tenant ID."
-            },
-            status_code=502
-        )
-

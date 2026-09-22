@@ -10,12 +10,7 @@
     "designation": "DENTAL SURGEON",
     "experience": "20 years"
   },
-  "languages": [
-    "English",
-    "Hindi",
-    "Marathi",
-    "Hinglish"
-  ],
+  "languages": ["English", "Hindi", "Marathi", "Hinglish"],
   "location": {
     "address": "SHOP NO 1 MONIKA 16 PIMPRI COLONY",
     "maps": "https://maps.app.goo.gl/H6872MYf2gdthTZ7A?g_st=ac"
@@ -26,12 +21,12 @@
   },
   "services": [
     {
-      "name": "Root Canal Treatment (RCT)",
-      "description": "Root canal treatment for tooth pain."
+      "name": "Appointment",
+      "description": "Book a dental appointment with the clinic."
     },
     {
-      "name": "Painless Extractions",
-      "description": "Specialised in painless dental treatment."
+      "name": "Treatment",
+      "description": "Ask about or book dental treatment."
     }
   ],
   "clinic": {
@@ -39,14 +34,7 @@
     "appointment_duration": "30 minutes"
   },
   "hours": {
-    "days": [
-      "Monday",
-      "Tuesday",
-      "Wednesday",
-      "Thursday",
-      "Friday",
-      "Saturday"
-    ],
+    "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
     "morning": "10 AM-1 PM",
     "evening": "6 PM-9 PM"
   },

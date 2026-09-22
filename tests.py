@@ -894,3 +894,102 @@ def test_24_invalid_age_rejected():
     app.handle_user_message(TEST_PHONE, "text", "abc")
     assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_AGE"
     assert "age" in sent_messages[0]["text"]["body"].lower()
+
+# ============================================================
+# 25. REAL BOOKING-DATE FLOW RETURNS LIVE SLOT OPTIONS
+# ============================================================
+def test_25_booking_date_flow_returns_live_slot_list(monkeypatch):
+    app.reset_conversation(TEST_PHONE, client_id="glaze-dental")
+    sent_messages.clear()
+
+    monkeypatch.setattr(
+        app,
+        "get_available_slots",
+        lambda client_id, date_str: ["10:00 AM", "11:00 AM", "06:00 PM"],
+    )
+
+    # Follow the same path as production WhatsApp: book -> service -> date.
+    app.handle_user_message(
+        TEST_PHONE,
+        "interactive",
+        "📅 Book appointment",
+        action_id="book_appointment",
+        client_id="glaze-dental",
+    )
+    app.handle_user_message(
+        TEST_PHONE,
+        "interactive",
+        "Appointment",
+        action_id="booking_service_0",
+        client_id="glaze-dental",
+    )
+
+    future = datetime.date.today() + datetime.timedelta(days=1)
+    if future.weekday() == 6:
+        future += datetime.timedelta(days=1)
+
+    sent_messages.clear()
+    app.handle_user_message(
+        TEST_PHONE,
+        "interactive",
+        "Tomorrow",
+        action_id=f"date_{future.isoformat()}",
+        client_id="glaze-dental",
+    )
+
+    conv = app.get_conversation(TEST_PHONE, client_id="glaze-dental")
+    assert conv["state"] == "BOOKING_TIME"
+    assert conv["appointment_date"] == future.isoformat()
+    assert len(sent_messages) == 1
+
+    payload = sent_messages[0]
+    assert payload["type"] == "interactive"
+    assert payload["interactive"]["type"] == "list"
+    rows = payload["interactive"]["action"]["sections"][0]["rows"]
+    assert [row["title"] for row in rows] == ["10:00 AM", "11:00 AM", "06:00 PM"]
+    assert rows[0]["id"] == "time_10:00 AM"
+
+
+def test_26_booking_date_flow_falls_back_to_text_if_list_send_fails(monkeypatch):
+    app.reset_conversation(TEST_PHONE, client_id="glaze-dental")
+    sent_messages.clear()
+
+    monkeypatch.setattr(app, "get_available_slots", lambda client_id, date_str: ["10:00 AM", "11:00 AM"])
+
+    def fail_list(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(app, "send_list_message", fail_list)
+
+    app.handle_user_message(
+        TEST_PHONE,
+        "interactive",
+        "📅 Book appointment",
+        action_id="book_appointment",
+        client_id="glaze-dental",
+    )
+    app.handle_user_message(
+        TEST_PHONE,
+        "interactive",
+        "Appointment",
+        action_id="booking_service_0",
+        client_id="glaze-dental",
+    )
+
+    future = datetime.date.today() + datetime.timedelta(days=1)
+    if future.weekday() == 6:
+        future += datetime.timedelta(days=1)
+
+    sent_messages.clear()
+    app.handle_user_message(
+        TEST_PHONE,
+        "interactive",
+        "Tomorrow",
+        action_id=f"date_{future.isoformat()}",
+        client_id="glaze-dental",
+    )
+
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["type"] == "text"
+    assert "10:00 AM" in sent_messages[0]["text"]["body"]
+    assert "11:00 AM" in sent_messages[0]["text"]["body"]

@@ -2021,3 +2021,53 @@ async def get_client_config_api(client_id: str = "glaze-dental"):
 async def save_client_config_api(request: Request):
     try:
         body = await request.json()
+        client_id = str(body.get("client_id", "")).strip()
+        client_name = str(body.get("client_name", "")).strip()
+        crm_base_url = str(body.get("crm_base_url", "")).strip()
+        phone_number_id = str(body.get("phone_number_id", "")).strip()
+
+        if not client_id or not client_name or not crm_base_url:
+            return JSONResponse(
+                {"status": "error", "message": "client_id, client_name and crm_base_url are required"},
+                status_code=400,
+            )
+
+        save_client_crm_config(
+            client_id=client_id,
+            client_name=client_name,
+            crm_base_url=crm_base_url,
+            phone_number_id=phone_number_id,
+        )
+        return {"status": "success", "message": "Client configuration saved"}
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.error("CLIENT CONFIG SAVE ERROR | %s: %s", type(exc).__name__, exc)
+        return JSONResponse({"status": "error", "message": "Unable to save client configuration"}, status_code=500)
+
+
+@app.get("/api/test-crm-connection")
+async def test_crm_connection_endpoint(
+    client_id: str = "glaze-dental",
+    test_date: Optional[str] = None,
+):
+    date_str = test_date or datetime.date.today().isoformat()
+    slots = get_available_slots(client_id, date_str)
+
+    if slots is not None:
+        return {
+            "status": "success",
+            "client_id": client_id,
+            "date": date_str,
+            "available_slots": slots,
+        }
+
+    return JSONResponse(
+        {
+            "status": "error",
+            "client_id": client_id,
+            "date": date_str,
+            "message": "CRM slots endpoint could not be verified",
+        },
+        status_code=502,
+    )

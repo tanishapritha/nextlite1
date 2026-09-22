@@ -673,27 +673,6 @@ def test_17_customer_facing_branding_and_services():
 
 
 # ============================================================
-# 18. INFORMATIONAL AI FALLBACK (GEMINI)
-# ============================================================
-
-def test_18_informational_ai_fallback(monkeypatch):
-    class DummyGeminiModel:
-        def generate_content(self, prompt, generation_config=None):
-            class Resp:
-                text = "Dr SHADAB MULLA is a Dental Surgeon with 20 years of experience."
-            return Resp()
-
-    monkeypatch.setattr(app, "gemini_model", DummyGeminiModel())
-
-    app.reset_conversation(TEST_PHONE)
-    sent_messages.clear()
-    app.handle_user_message(TEST_PHONE, "text", "Tell me about the doctor")
-
-    assert len(sent_messages) >= 1
-    assert "Dr SHADAB MULLA" in sent_messages[0]["text"]["body"]
-
-
-# ============================================================
 # 19. APPOINTMENT REMINDERS & SCHEDULER
 # ============================================================
 

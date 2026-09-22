@@ -11,7 +11,6 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
-import google.generativeai as genai
 
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
@@ -31,8 +30,6 @@ app = FastAPI(title="Glaze Dental Clinic WhatsApp AI")
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "nextlite-demo")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v26.0")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
 # Client A (Glaze) credentials are kept by us for now.
 # Only the environment-variable name is stored in the tenant configuration.
 GLAZE_WHATSAPP_TOKEN = os.getenv("GLAZE_WHATSAPP_TOKEN", "")
@@ -52,21 +49,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("nextlite")
-
-
-# ============================================================
-# GEMINI AI
-# ============================================================
-
-gemini_model = None
-
-if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-2.5-flash")
-        logger.info("Gemini initialized successfully")
-    except Exception as exc:
-        logger.error("Gemini initialization failed | %s: %s", type(exc).__name__, exc)
 
 
 # ============================================================
@@ -1272,53 +1254,6 @@ def is_pricing_question(text: str) -> bool:
 
 
 # ============================================================
-# GEMINI FREE TEXT FALLBACK
-# ============================================================
-
-def ask_gemini(question: str) -> Optional[str]:
-    import sys
-    # Look up via the top-level 'app' package so monkeypatching app.gemini_model in tests works.
-    _pkg = sys.modules.get("app", sys.modules[__name__])
-    _model = getattr(_pkg, "gemini_model", None)
-    if not _model:
-        return None
-
-
-    knowledge_text = json.dumps(KNOWLEDGE, ensure_ascii=False, indent=2)
-
-    prompt = f"""
-You are the customer support assistant for {clinic_name()}.
-
-Answer the customer's question using ONLY the verified information in the knowledge base below.
-
-CRITICAL RULES:
-- Do NOT invent prices, consultation fees, discounts, or treatment costs.
-- Do NOT invent doctors, branches, insurance, or medical guarantees.
-- If asked about prices or fees, clearly state that pricing details are not listed and recommend calling {clinic_name()} at 9822977740.
-- If the answer is not available in the knowledge base, politely explain that you do not have that information and suggest contacting the clinic at 9822977740.
-- Keep the answer short (1-3 sentences), reassuring, and natural for WhatsApp.
-
-Knowledge base:
-{knowledge_text}
-
-Customer question:
-{question}
-"""
-    try:
-        response = _model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.2, "max_output_tokens": 200}
-        )
-        answer = getattr(response, "text", None)
-        if answer:
-            return answer.strip()
-    except Exception as exc:
-        logger.error("GEMINI ERROR | %s: %s", type(exc).__name__, exc)
-
-    return None
-
-
-# ============================================================
 # DETERMINISTIC BOOKING STATE MACHINE
 # ============================================================
 
@@ -1408,12 +1343,11 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         if action_id in {"clinic_info", "btn_info"}:
             return send_clinic_info(phone)
 
-        # Free-text Q&A
-        answer = ask_gemini(text)
-        if answer:
-            send_text_message(phone, answer)
-        else:
-            send_text_message(phone, "I can help with appointment bookings, services, and clinic information.")
+        # Deterministic free-text fallback. The bot does not use an LLM in the booking path.
+        send_text_message(
+            phone,
+            "I can help with appointment bookings, services, and clinic information. Please choose an option from the main menu."
+        )
         return
 
     # --------------------------------------------------------

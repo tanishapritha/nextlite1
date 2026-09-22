@@ -816,3 +816,32 @@ def test_21_unknown_input_no_unsolicited_welcome(monkeypatch):
     app.handle_user_message(TEST_PHONE, "text", "some unsupported random input")
 
     assert sent_messages == []
+
+# ============================================================
+# 22. CANCEL DOES NOT SEND A WELCOME MENU
+# ============================================================
+def test_22_cancel_has_single_outbound_no_welcome_loop():
+    app.reset_conversation(TEST_PHONE)
+    app.update_conversation(
+        TEST_PHONE,
+        state="BOOKING_CONFIRMATION",
+        service="Appointment",
+        patient_name="Test Patient",
+        patient_type="New",
+        appointment_date="2026-09-30",
+        appointment_time="06:00 PM",
+    )
+
+    sent_messages.clear()
+    app.handle_user_message(
+        TEST_PHONE,
+        "interactive",
+        "Cancel",
+        action_id="cancel_booking",
+    )
+
+    assert app.get_conversation(TEST_PHONE)["state"] == "IDLE"
+    assert len(sent_messages) == 1
+    body = sent_messages[0]["text"]["body"]
+    assert "cancelled" in body.lower()
+    assert "Welcome to Glaze" not in body

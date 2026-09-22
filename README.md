@@ -26,7 +26,6 @@ META_APP_SECRET=your_meta_app_secret
 META_GRAPH_API_VERSION=v26.0
 GLAZE_CRM_TENANT_KEY=your_glaze_crm_tenant_key
 META_REMINDER_TEMPLATE=glaze_appointment_1h_reminder
-GEMINI_API_KEY=optional_gemini_api_key
 ```
 
 ### 3. Run Locally & Import Check

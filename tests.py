@@ -253,6 +253,7 @@ def test_06_crm_booking_201_success(monkeypatch):
     payload = captured_posts[0]["json"]
     assert payload["customerName"] == "Rahul Sharma"
     assert payload["customerPhone"] == TEST_PHONE
+    assert payload["age"] == "24"
     assert payload["bookingDate"] == "2026-09-21"
     assert payload["bookingTime"] == "10:00 AM"
     assert payload["title"] == "WhatsApp Consultation"
@@ -275,6 +276,7 @@ def test_07_booking_confirmation_stop_no_welcome_loop(monkeypatch):
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
     app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "text", "24")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
     app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
@@ -304,6 +306,7 @@ def test_08_crm_409_conflict_handling(monkeypatch):
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
     app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "text", "24")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
     app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
@@ -337,6 +340,7 @@ def test_09_crm_other_failures_no_leakage(monkeypatch):
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
     app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "text", "24")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
     app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
@@ -376,6 +380,7 @@ def test_10_double_booking_protection(monkeypatch):
     app.handle_user_message("+911111111111", "interactive", "📅 Book appointment", action_id="book_appointment")
     app.handle_user_message("+911111111111", "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message("+911111111111", "text", "Patient One")
+    app.handle_user_message("+911111111111", "text", "31")
     app.handle_user_message("+911111111111", "interactive", "New patient", action_id="patient_new")
     app.handle_user_message("+911111111111", "text", mon_dt.isoformat())
     app.handle_user_message("+911111111111", "interactive", "10:00 AM", action_id="time_10:00 AM")
@@ -389,6 +394,7 @@ def test_10_double_booking_protection(monkeypatch):
     app.handle_user_message("+912222222222", "interactive", "📅 Book appointment", action_id="book_appointment")
     app.handle_user_message("+912222222222", "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message("+912222222222", "text", "Patient Two")
+    app.handle_user_message("+912222222222", "text", "32")
     app.handle_user_message("+912222222222", "interactive", "New patient", action_id="patient_new")
     app.handle_user_message("+912222222222", "text", mon_dt.isoformat())
     app.handle_user_message("+912222222222", "interactive", "10:00 AM", action_id="time_10:00 AM")
@@ -428,6 +434,7 @@ def test_11_crm_success_whatsapp_failure_protection(monkeypatch):
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
     app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Test Patient")
+    app.handle_user_message(TEST_PHONE, "text", "29")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
     app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
@@ -634,6 +641,7 @@ def test_16_date_time_validation():
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
     app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
+    app.handle_user_message(TEST_PHONE, "text", "24")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
 
     # Past date
@@ -771,6 +779,9 @@ def test_20_service_first_flow_collects_remaining_booking_fields(monkeypatch):
     assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_NAME"
 
     app.handle_user_message(TEST_PHONE, "text", "Test Patient")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_AGE"
+
+    app.handle_user_message(TEST_PHONE, "text", "29")
     assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_PATIENT_TYPE"
 
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")

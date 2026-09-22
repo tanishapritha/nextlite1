@@ -20,6 +20,5 @@ from app.main import (  # noqa: F401
     save_client_crm_config,
     schedule_appointment_reminder,
     process_due_reminders,
-    gemini_model,
     requests,
 )

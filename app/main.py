@@ -58,7 +58,7 @@ logger = logging.getLogger("nextlite")
 DEFAULT_KNOWLEDGE = {
     "client_id": "glaze-dental",
     "client_name": "Glaze Dental Clinic",
-    "crm_base_url": "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com",
+    "crm_base_url": "https://vanifyai.online",
     "phone_number_id": "1208541249018781",
     "assistant_name": "Glaze Dental Clinic Assistant",
     "doctor": {
@@ -335,7 +335,7 @@ def init_db():
     # Seed default Glaze Dental client config
     seed_client_id = KNOWLEDGE.get("client_id", "glaze-dental")
     seed_client_name = KNOWLEDGE.get("client_name", "Glaze Dental Clinic")
-    seed_crm_base_url = KNOWLEDGE.get("crm_base_url", "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com").rstrip("/")
+    seed_crm_base_url = KNOWLEDGE.get("crm_base_url", "https://vanifyai.online").rstrip("/")
     seed_phone_number_id = KNOWLEDGE.get("phone_number_id", "").strip()
     seed_whatsapp_token_env = "GLAZE_WHATSAPP_TOKEN"
     seed_crm_tenant_key_env = "GLAZE_CRM_TENANT_KEY"
@@ -1883,7 +1883,7 @@ async def dashboard_portal(client_id: str = "glaze-dental"):
         </div>
         <div class="form-group">
             <label>CRM API Base URL</label>
-            <input type="text" id="crmBaseUrl" value="{config['crm_base_url']}" placeholder="https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com" required>
+            <input type="text" id="crmBaseUrl" value="{config['crm_base_url']}" placeholder="https://vanifyai.online" required>
         </div>
         <div class="form-group">
             <label>WhatsApp Phone Number ID</label>

@@ -191,7 +191,7 @@ def test_05_crm_get_slots_http_integration(monkeypatch):
 
     assert slots == ["10:00 AM", "11:00 AM"]
     assert len(captured_requests) == 1
-    assert "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com/api/v1/integrations/whatsapp/slots" in captured_requests[0]["url"]
+    assert "https://vanifyai.online/api/v1/integrations/whatsapp/slots" in captured_requests[0]["url"]
     assert captured_requests[0]["params"]["date"] == "2026-09-21"
     assert captured_requests[0]["headers"]["X-Tenant-Key"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120"
 
@@ -247,7 +247,7 @@ def test_06_crm_booking_201_success(monkeypatch):
 
     assert res["status"] == "success"
     assert res["data"]["appointmentId"] == "CRM-201-OK"
-    assert len(captured_posts) == 1    assert "https://nextlite-voice-prod.indiasouthcentral.cloudapp.azure.com/api/v1/integrations/whatsapp/appointments/book" in captured_posts[0]["url"]
+    assert len(captured_posts) == 1    assert "https://vanifyai.online/api/v1/integrations/whatsapp/appointments/book" in captured_posts[0]["url"]
     assert captured_posts[0]["headers"]["X-Tenant-Key"] == "6b4b6128-5b5f-4d2f-b5de-91511ab9b120"
 
     payload = captured_posts[0]["json"]

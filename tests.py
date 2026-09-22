@@ -274,7 +274,7 @@ def test_07_booking_confirmation_stop_no_welcome_loop(monkeypatch):
     mon_dt = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7 or 7)
 
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
@@ -303,7 +303,7 @@ def test_08_crm_409_conflict_handling(monkeypatch):
     monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM", "12:00 PM"])
 
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
@@ -336,7 +336,7 @@ def test_09_crm_other_failures_no_leakage(monkeypatch):
     monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM"])
 
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
@@ -375,7 +375,7 @@ def test_10_double_booking_protection(monkeypatch):
 
     app.reset_conversation("+911111111111")
     app.handle_user_message("+911111111111", "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message("+911111111111", "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message("+911111111111", "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message("+911111111111", "text", "Patient One")
     app.handle_user_message("+911111111111", "interactive", "New patient", action_id="patient_new")
     app.handle_user_message("+911111111111", "text", mon_dt.isoformat())
@@ -388,7 +388,7 @@ def test_10_double_booking_protection(monkeypatch):
 
     app.reset_conversation("+912222222222")
     app.handle_user_message("+912222222222", "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message("+912222222222", "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message("+912222222222", "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message("+912222222222", "text", "Patient Two")
     app.handle_user_message("+912222222222", "interactive", "New patient", action_id="patient_new")
     app.handle_user_message("+912222222222", "text", mon_dt.isoformat())
@@ -427,7 +427,7 @@ def test_11_crm_success_whatsapp_failure_protection(monkeypatch):
 
     app.reset_conversation(TEST_PHONE)
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Test Patient")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
     app.handle_user_message(TEST_PHONE, "text", mon_dt.isoformat())
@@ -603,7 +603,7 @@ def test_14_emergency_interceptor_priority():
     # Emergency during active booking state
     app.reset_conversation(TEST_PHONE)
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_NAME"
 
     sent_messages.clear()
@@ -634,7 +634,7 @@ def test_15_pricing_safety():
 def test_16_date_time_validation():
     app.reset_conversation(TEST_PHONE)
     app.handle_user_message(TEST_PHONE, "interactive", "📅 Book appointment", action_id="book_appointment")
-    app.handle_user_message(TEST_PHONE, "interactive", "Root Canal Treatment (RCT)", action_id="booking_service_0")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="booking_service_0")
     app.handle_user_message(TEST_PHONE, "text", "Rahul Sharma")
     app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
 
@@ -748,3 +748,71 @@ def test_20_security_credentials_and_logging(test_client):
     assert "crm_tenant_id" not in data
     assert "GLAZE_CRM_TENANT_KEY" not in json.dumps(data)
     assert "GLAZE_WHATSAPP_TOKEN" not in json.dumps(data)
+
+
+# ============================================================
+# 19. SERVICES MENU -> BOOKING DATE (NO SILENT STOP)
+# ============================================================
+def test_19_services_selection_continues_to_booking_date(monkeypatch):
+    app.reset_conversation(TEST_PHONE)
+    sent_messages.clear()
+
+    app.handle_user_message(TEST_PHONE, "interactive", "🦷 Our services", action_id="services")
+    assert len(sent_messages) == 1
+
+    sent_messages.clear()
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="service_0")
+
+    conv = app.get_conversation(TEST_PHONE)
+    assert conv["state"] == "BOOKING_DATE"
+    assert conv["service"] == "Appointment"
+    assert len(sent_messages) == 1
+    assert "When would you like your appointment?" in sent_messages[0]["interactive"]["body"]["text"]
+
+
+# ============================================================
+# 20. SERVICE-FIRST FLOW COLLECTS DATE, TIME, NAME, PATIENT TYPE
+# ============================================================
+def test_20_service_first_flow_collects_remaining_booking_fields(monkeypatch):
+    app.reset_conversation(TEST_PHONE)
+    sent_messages.clear()
+
+    monkeypatch.setattr(app, "get_available_slots", lambda c, d: ["10:00 AM"])
+    monkeypatch.setattr(app.CRMClient, "get_available_slots", lambda c, d: ["10:00 AM"])
+
+    app.handle_user_message(TEST_PHONE, "interactive", "🦷 Our services", action_id="services")
+    app.handle_user_message(TEST_PHONE, "interactive", "Appointment", action_id="service_0")
+
+    today = datetime.date.today()
+    if today.weekday() == 6:
+        today = today + datetime.timedelta(days=1)
+
+    app.handle_user_message(TEST_PHONE, "interactive", "Today", action_id=f"date_{today.isoformat()}")
+    conv = app.get_conversation(TEST_PHONE)
+    assert conv["state"] == "BOOKING_TIME"
+
+    app.handle_user_message(TEST_PHONE, "interactive", "10:00 AM", action_id="time_10:00 AM")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_NAME"
+
+    app.handle_user_message(TEST_PHONE, "text", "Test Patient")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_PATIENT_TYPE"
+
+    app.handle_user_message(TEST_PHONE, "interactive", "New patient", action_id="patient_new")
+    assert app.get_conversation(TEST_PHONE)["state"] == "BOOKING_CONFIRMATION"
+
+    summary = sent_messages[-1]["interactive"]["body"]["text"]
+    assert "Appointment" in summary
+    assert "Test Patient" in summary
+    assert "10:00 AM" in summary
+
+
+# ============================================================
+# 21. UNKNOWN INPUT DOES NOT TRIGGER WELCOME MENU
+# ============================================================
+def test_21_unknown_input_no_unsolicited_welcome(monkeypatch):
+    app.reset_conversation(TEST_PHONE)
+    sent_messages.clear()
+
+    app.handle_user_message(TEST_PHONE, "text", "some unsupported random input")
+
+    assert sent_messages == []

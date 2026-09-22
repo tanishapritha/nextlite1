@@ -249,7 +249,8 @@ def init_db():
         ("patient_type", "TEXT"),
         ("appointment_date", "TEXT"),
         ("appointment_time", "TEXT"),
-    ]:        if _col not in _existing_conv_cols:
+    ]:
+        if _col not in _existing_conv_cols:
             cursor.execute(f"ALTER TABLE conversations ADD COLUMN {_col} {_def}")
 
     # Existing deployments used phone as the sole primary key. Rebuild that
@@ -1773,7 +1774,8 @@ async def whatsapp_webhook(request: Request):
                 elif msg_type == "interactive":
                     interactive = message.get("interactive", {})
                     itype = interactive.get("type")
-                    if itype == "button_reply":                        btn = interactive.get("button_reply", {})
+                    if itype == "button_reply":
+                        btn = interactive.get("button_reply", {})
                         action_id = btn.get("id")
                         text_content = btn.get("title", "").strip()
                     elif itype == "list_reply":

@@ -1166,26 +1166,26 @@ def process_due_reminders() -> int:
 # UI & MESSAGES
 # ============================================================
 
-def main_menu(phone: str) -> bool:
+def main_menu(phone: str, client_id: Optional[str] = None) -> bool:
     body = f"Hi! 👋 Welcome to {clinic_name()}.\n\nHow can we help you today?"
     buttons = [
         {"id": "book_appointment", "title": "📅 Book appointment"},
         {"id": "services", "title": "🦷 Our services"},
         {"id": "clinic_info", "title": "📍 Clinic info"}
     ]
-    return send_button_message(phone, body, buttons)
+    return send_button_message(phone, body, buttons, client_id=client_id)
 
 
-def send_services(phone: str) -> bool:
+def send_services(phone: str, client_id: Optional[str] = None) -> bool:
     services = get_configured_services()
     rows = []
     for i, s in enumerate(services):
         rows.append({"id": f"service_{i}", "title": s["name"][:24], "description": s["description"][:72]})
 
-    return send_list_message(phone, f"Here are the services available at {clinic_name()}:", "View services", rows)
+    return send_list_message(phone, f"Here are the services available at {clinic_name()}:", "View services", rows, client_id=client_id)
 
 
-def send_clinic_info(phone: str) -> bool:
+def send_clinic_info(phone: str, client_id: Optional[str] = None) -> bool:
     doctor = KNOWLEDGE.get("doctor", {})
     location = KNOWLEDGE.get("location", {})
     contact = KNOWLEDGE.get("contact", {})
@@ -1203,27 +1203,27 @@ def send_clinic_info(phone: str) -> bool:
         f"• {hours.get('morning', '10 AM-1 PM')}\n"
         f"• {hours.get('evening', '6 PM-9 PM')}"
     )
-    return send_text_message(phone, text)
+    return send_text_message(phone, text, client_id=client_id)
 
 
-def send_booking_services(phone: str) -> bool:
+def send_booking_services(phone: str, client_id: Optional[str] = None) -> bool:
     services = get_configured_services()
     rows = []
     for i, s in enumerate(services):
         rows.append({"id": f"booking_service_{i}", "title": s["name"][:24], "description": s["description"][:72]})
 
-    return send_list_message(phone, "What treatment would you like to book?", "Choose service", rows)
+    return send_list_message(phone, "What treatment would you like to book?", "Choose service", rows, client_id=client_id)
 
 
-def send_patient_type_options(phone: str) -> bool:
+def send_patient_type_options(phone: str, client_id: Optional[str] = None) -> bool:
     buttons = [
         {"id": "patient_new", "title": "New patient"},
         {"id": "patient_existing", "title": "Existing patient"}
     ]
-    return send_button_message(phone, "Are you a new or existing patient?", buttons)
+    return send_button_message(phone, "Are you a new or existing patient?", buttons, client_id=client_id)
 
 
-def send_date_options(phone: str) -> bool:
+def send_date_options(phone: str, client_id: Optional[str] = None) -> bool:
     today = datetime.date.today()
     tomorrow = today + datetime.timedelta(days=1)
     body = "When would you like your appointment? (Working days: Monday to Saturday)"
@@ -1232,7 +1232,7 @@ def send_date_options(phone: str) -> bool:
         {"id": f"date_{tomorrow.isoformat()}", "title": "Tomorrow"},
         {"id": "choose_date", "title": "Choose another date"}
     ]
-    return send_button_message(phone, body, buttons)
+    return send_button_message(phone, body, buttons, client_id=client_id)
 
 
 def parse_date_input(text: str) -> Optional[str]:
@@ -1299,7 +1299,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             "🚨 This may require urgent attention. Please call Glaze Dental Clinic at 9822977740 "
             "immediately for emergency assistance."
         )
-        send_text_message(phone, emergency_msg)
+        send_text_message(phone, emergency_msg, client_id=client_id)
         return
 
     # --------------------------------------------------------
@@ -1309,11 +1309,11 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         reset_conversation(phone, client_id=client_id)
 
         if normalized == "cancel" or action_id in {"cancel_booking", "btn_cancel"}:
-            send_text_message(phone, "Your booking process has been cancelled. Let us know whenever you'd like to book or ask a question.")
+            send_text_message(phone, "Your booking process has been cancelled. Let us know whenever you'd like to book or ask a question.", client_id=client_id)
             return
 
         if normalized in {"restart", "reset", "menu", "main menu"}:
-            return main_menu(phone)
+            return main_menu(phone, client_id=client_id)
 
         return
 
@@ -1330,7 +1330,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     # --------------------------------------------------------
     if is_pricing_question(text) and current_state == "IDLE":
         price_msg = "Pricing details are not listed. Please contact Glaze Dental Clinic at 9822977740 for treatment charges."
-        send_text_message(phone, price_msg)
+        send_text_message(phone, price_msg, client_id=client_id)
         return
 
     # --------------------------------------------------------
@@ -1339,10 +1339,10 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     if current_state == "IDLE":
         if action_id in {"book_appointment", "btn_book"} or "book" in normalized or "appointment" in normalized:
             update_conversation(phone, state="BOOKING_SERVICE")
-            return send_booking_services(phone)
+            return send_booking_services(phone, client_id=client_id)
 
         if action_id in {"services", "btn_services"}:
-            return send_services(phone)
+            return send_services(phone, client_id=client_id)
 
         # Selecting a service from the informational services menu continues into booking.
         if action_id and action_id.startswith("service_"):
@@ -1352,14 +1352,14 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                 if 0 <= idx < len(services):
                     service = services[idx]["name"]
                     update_conversation(phone, state="BOOKING_DATE", service=service)
-                    return send_date_options(phone)
+                    return send_date_options(phone, client_id=client_id)
             except (ValueError, IndexError):
                 pass
-            send_text_message(phone, "Please choose one of the available services.")
+            send_text_message(phone, "Please choose one of the available services.", client_id=client_id)
             return send_services(phone)
 
         if action_id in {"clinic_info", "btn_info"}:
-            return send_clinic_info(phone)
+            return send_clinic_info(phone, client_id=client_id)
 
         # Deterministic free-text fallback. The bot does not use an LLM in the booking path.
         send_text_message(
@@ -1391,11 +1391,11 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                     break
 
         if not service:
-            send_text_message(phone, "Please choose one of the available dental services below:")
+            send_text_message(phone, "Please choose one of the available dental services below:", client_id=client_id)
             return send_booking_services(phone)
 
         update_conversation(phone, state="BOOKING_NAME", service=service)
-        send_text_message(phone, f"You selected: *{service}*.\n\nPlease provide the patient's *full name*:")
+        send_text_message(phone, f"You selected: *{service}*.\n\nPlease provide the patient's *full name*:", client_id=client_id)
         return
 
     # --------------------------------------------------------
@@ -1404,11 +1404,11 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     if current_state == "BOOKING_NAME":
         patient_name = text.strip()
         if len(patient_name) < 2 or patient_name.isdigit():
-            send_text_message(phone, "Please enter a valid patient name (e.g. Rahul Sharma):")
+            send_text_message(phone, "Please enter a valid patient name (e.g. Rahul Sharma, client_id=client_id):")
             return
 
         update_conversation(phone, state="BOOKING_AGE", patient_name=patient_name)
-        send_text_message(phone, "Thanks! Please provide the patient's *age*:")
+        send_text_message(phone, "Thanks! Please provide the patient's *age*:", client_id=client_id)
         return
 
     # --------------------------------------------------------
@@ -1417,16 +1417,16 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     if current_state == "BOOKING_AGE":
         age_text = text.strip()
         if not age_text.isdigit():
-            send_text_message(phone, "Please enter the patient's age as a number (for example: 24):")
+            send_text_message(phone, "Please enter the patient's age as a number (for example: 24, client_id=client_id):")
             return
 
         age_value = int(age_text)
         if age_value < 1 or age_value > 120:
-            send_text_message(phone, "Please enter a valid age between 1 and 120:")
+            send_text_message(phone, "Please enter a valid age between 1 and 120:", client_id=client_id)
             return
 
         update_conversation(phone, state="BOOKING_PATIENT_TYPE", patient_age=str(age_value))
-        return send_patient_type_options(phone)
+        return send_patient_type_options(phone, client_id=client_id)
 
     # --------------------------------------------------------
     # 9. BOOKING_PATIENT_TYPE
@@ -1439,7 +1439,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             patient_type = "Existing"
 
         if not patient_type:
-            send_text_message(phone, "Please indicate whether you are a new or existing patient:")
+            send_text_message(phone, "Please indicate whether you are a new or existing patient:", client_id=client_id)
             return send_patient_type_options(phone)
 
         latest = get_conversation(phone, client_id=client_id)
@@ -1472,13 +1472,13 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         if action_id and action_id.startswith("date_"):
             appointment_date = action_id.replace("date_", "")
         elif action_id == "choose_date":
-            send_text_message(phone, "Please send your preferred date in YYYY-MM-DD format (for example: 2026-09-20):")
+            send_text_message(phone, "Please send your preferred date in YYYY-MM-DD format (for example: 2026-09-20, client_id=client_id):")
             return
         else:
             appointment_date = parse_date_input(text)
 
         if not appointment_date:
-            send_text_message(phone, "I couldn't recognize that date. Please use YYYY-MM-DD (e.g., 2026-09-20) or choose Today/Tomorrow:")
+            send_text_message(phone, "I couldn't recognize that date. Please use YYYY-MM-DD (e.g., 2026-09-20, client_id=client_id) or choose Today/Tomorrow:")
             return send_date_options(phone)
 
         # Date Validation: Past Date & Sunday
@@ -1487,14 +1487,14 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             today_dt = datetime.date.today()
 
             if parsed_dt < today_dt:
-                send_text_message(phone, "Appointments cannot be booked for past dates. Please choose an upcoming date (Monday to Saturday):")
+                send_text_message(phone, "Appointments cannot be booked for past dates. Please choose an upcoming date (Monday to Saturday, client_id=client_id):")
                 return send_date_options(phone)
 
             if parsed_dt.weekday() == 6:  # Sunday
-                send_text_message(phone, "Glaze Dental Clinic is closed on Sundays. Please choose a date from Monday to Saturday:")
+                send_text_message(phone, "Glaze Dental Clinic is closed on Sundays. Please choose a date from Monday to Saturday:", client_id=client_id)
                 return send_date_options(phone)
         except ValueError:
-            send_text_message(phone, "Invalid date format. Please use YYYY-MM-DD:")
+            send_text_message(phone, "Invalid date format. Please use YYYY-MM-DD:", client_id=client_id)
             return send_date_options(phone)
 
         # Query CRM for live available slots
@@ -1519,7 +1519,12 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
 
         update_conversation(phone, state="BOOKING_TIME", appointment_date=appointment_date)
         rows = [{"id": f"time_{slot}", "title": slot[:24], "description": "Available"} for slot in available_slots[:10]]
-        return send_list_message(phone, f"Available slots for *{appointment_date}*:", "Choose time", rows)
+        sent = send_list_message(phone, f"Available slots for *{appointment_date}*:", "Choose time", rows, client_id=client_id)
+        if not sent:
+            fallback = "Available slots for " + appointment_date + ":\n\n" + "\n".join(f"• {slot}" for slot in available_slots[:10]) + "\n\nReply with the exact time you want."
+            logger.warning("TIME OPTIONS LIST FAILED | client=%s | user=%s | falling back to text", client_id, phone)
+            return send_text_message(phone, fallback, client_id=client_id)
+        return sent
 
     # --------------------------------------------------------
     # 11. BOOKING_TIME
@@ -1544,9 +1549,9 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                     break
 
             if not selected_time:
-                send_text_message(phone, "Please select one of the available slots listed below:")
+                send_text_message(phone, "Please select one of the available slots listed below:", client_id=client_id)
                 rows = [{"id": f"time_{slot}", "title": slot[:24], "description": "Available"} for slot in available_slots[:10]]
-                return send_list_message(phone, f"Available slots for *{appointment_date}*:", "Choose time", rows)
+                return send_list_message(phone, f"Available slots for *{appointment_date}*:", "Choose time", rows, client_id=client_id)
 
         update_conversation(phone, state="BOOKING_CONFIRMATION", appointment_time=selected_time)
 
@@ -1554,10 +1559,10 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         latest = get_conversation(phone, client_id=client_id)
         if not latest.get("patient_name"):
             update_conversation(phone, state="BOOKING_NAME", appointment_time=selected_time)
-            return send_text_message(phone, "What is the patient's *full name*?")
+            return send_text_message(phone, "What is the patient's *full name*?", client_id=client_id)
         if not latest.get("patient_age"):
             update_conversation(phone, state="BOOKING_AGE", appointment_time=selected_time)
-            return send_text_message(phone, "Thanks! Please provide the patient's *age*:")
+            return send_text_message(phone, "Thanks! Please provide the patient's *age*:", client_id=client_id)
         if not latest.get("patient_type"):
             update_conversation(phone, state="BOOKING_PATIENT_TYPE", appointment_time=selected_time)
             return send_patient_type_options(phone)
@@ -1580,7 +1585,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             {"id": "confirm_booking", "title": "Confirm"},
             {"id": "cancel_booking", "title": "Cancel"}
         ]
-        return send_button_message(phone, summary, buttons)
+        return send_button_message(phone, summary, buttons, client_id=client_id)
 
     # --------------------------------------------------------
     # 12. BOOKING_CONFIRMATION
@@ -1644,7 +1649,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                     f"Service: {c_service}\n\n"
                     "Thank you!"
                 )
-                send_text_message(phone, confirmation_msg)
+                send_text_message(phone, confirmation_msg, client_id=client_id)
                 # CRITICAL: STOP HERE. DO NOT SEND WELCOME MENU AGAIN.
                 return
 
@@ -1662,10 +1667,15 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                 if fresh_slots:
                     update_conversation(phone, state="BOOKING_TIME")
                     rows = [{"id": f"time_{slot}", "title": slot[:24], "description": "Available"} for slot in fresh_slots[:10]]
-                    return send_list_message(phone, f"Fresh available slots for *{c_date}*:", "Choose time", rows)
+                    sent = send_list_message(phone, f"Fresh available slots for *{c_date}*:", "Choose time", rows, client_id=client_id)
+                    if not sent:
+                        fallback = "Fresh available slots for " + c_date + ":\n\n" + "\n".join(f"• {slot}" for slot in fresh_slots[:10]) + "\n\nReply with the exact time you want."
+                        logger.warning("FRESH TIME OPTIONS LIST FAILED | client=%s | user=%s | falling back to text", client_id, phone)
+                        return send_text_message(phone, fallback, client_id=client_id)
+                    return sent
                 else:
                     update_conversation(phone, state="BOOKING_DATE")
-                    send_text_message(phone, f"No more slots remain on {c_date}. Please choose another date:")
+                    send_text_message(phone, f"No more slots remain on {c_date}. Please choose another date:", client_id=client_id)
                     return send_date_options(phone)
 
             else:
@@ -1680,16 +1690,16 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
 
         elif action_id in {"cancel_booking", "btn_cancel"} or normalized in {"cancel", "no"}:
             reset_conversation(phone, client_id=client_id)
-            send_text_message(phone, "Your appointment booking has been cancelled.")
+            send_text_message(phone, "Your appointment booking has been cancelled.", client_id=client_id)
             return
 
         else:
-            send_text_message(phone, "Please choose Confirm or Cancel:")
+            send_text_message(phone, "Please choose Confirm or Cancel:", client_id=client_id)
             buttons = [
                 {"id": "confirm_booking", "title": "Confirm"},
                 {"id": "cancel_booking", "title": "Cancel"}
             ]
-            return send_button_message(phone, "Would you like to confirm your appointment?", buttons)
+            return send_button_message(phone, "Would you like to confirm your appointment?", buttons, client_id=client_id)
 
     # --------------------------------------------------------
     # 13. FALLBACK

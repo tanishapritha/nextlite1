@@ -102,12 +102,12 @@ DEFAULT_KNOWLEDGE = {
     # EXACTLY TWO SERVICES CONFIGURED IN ONE PLACE
     "services": [
         {
-            "name": "Root Canal Treatment (RCT)",
-            "description": "Root canal treatment for tooth pain."
+            "name": "Appointment",
+            "description": "Book a dental appointment with the clinic."
         },
         {
-            "name": "Painless Extractions",
-            "description": "Specialised in painless dental treatment."
+            "name": "Treatment",
+            "description": "Ask about or book dental treatment."
         }
     ],
     "clinic": {
@@ -560,7 +560,7 @@ class CRMClient:
 
         try:
             logger.info("CRM SLOTS REQUEST | client=%s | date=%s", client_id, date_str)
-            response = requests.get(url, params={"date": date_str}, headers=headers, timeout=15)
+            response = requests.get(url, params={"date": date_str}, headers=headers, timeout=15, verify=True)
             logger.info("CRM SLOTS | client=%s | date=%s | status=%d", client_id, date_str, response.status_code)
 
             if response.status_code != 200:
@@ -569,8 +569,11 @@ class CRMClient:
 
             data = response.json()
             return data.get("availableSlots", [])
+        except requests.exceptions.SSLError as exc:
+            logger.error("CRM SLOTS TLS ERROR | url=%s | detail=%s", url, repr(exc))
+            return None
         except requests.RequestException as exc:
-            logger.error("CRM SLOTS REQUEST ERROR | %s", repr(exc))
+            logger.error("CRM SLOTS REQUEST ERROR | url=%s | detail=%s", url, repr(exc))
             return None
         except Exception as exc:
             logger.error("CRM SLOTS ERROR | %s", repr(exc))
@@ -1368,7 +1371,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     if is_pricing_question(text) and current_state == "IDLE":
         price_msg = "Pricing details are not listed. Please contact Glaze Dental Clinic at 9822977740 for treatment charges."
         send_text_message(phone, price_msg)
-        return main_menu(phone)
+        return
 
     # --------------------------------------------------------
     # 5. IDLE STATE
@@ -1381,6 +1384,20 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         if action_id in {"services", "btn_services"}:
             return send_services(phone)
 
+        # Selecting a service from the informational services menu continues into booking.
+        if action_id and action_id.startswith("service_"):
+            try:
+                idx = int(action_id.replace("service_", ""))
+                services = get_configured_services()
+                if 0 <= idx < len(services):
+                    service = services[idx]["name"]
+                    update_conversation(phone, state="BOOKING_DATE", service=service)
+                    return send_date_options(phone)
+            except (ValueError, IndexError):
+                pass
+            send_text_message(phone, "Please choose one of the available services.")
+            return send_services(phone)
+
         if action_id in {"clinic_info", "btn_info"}:
             return send_clinic_info(phone)
 
@@ -1390,7 +1407,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             send_text_message(phone, answer)
         else:
             send_text_message(phone, "I can help with appointment bookings, services, and clinic information.")
-        return main_menu(phone)
+        return
 
     # --------------------------------------------------------
     # 6. BOOKING_SERVICE
@@ -1418,9 +1435,9 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             send_text_message(phone, "Please choose one of the available dental services below:")
             return send_booking_services(phone)
 
-        update_conversation(phone, state="BOOKING_NAME", service=service)
-        send_text_message(phone, f"You selected: *{service}*.\n\nPlease provide the patient's *full name*:")
-        return
+        update_conversation(phone, state="BOOKING_DATE", service=service)
+        send_text_message(phone, f"You selected: *{service}*.")
+        return send_date_options(phone)
 
     # --------------------------------------------------------
     # 7. BOOKING_NAME
@@ -1448,7 +1465,23 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             send_text_message(phone, "Please indicate whether you are a new or existing patient:")
             return send_patient_type_options(phone)
 
-        update_conversation(phone, state="BOOKING_DATE", patient_type=patient_type)
+        latest = get_conversation(phone, client_id=client_id)
+        update_conversation(phone, state="BOOKING_CONFIRMATION", patient_type=patient_type)
+        if latest.get("appointment_date") and latest.get("appointment_time"):
+            latest = get_conversation(phone, client_id=client_id)
+            summary = (
+                "Please confirm your appointment:\n\n"
+                f"👤 Name: {latest.get('patient_name', 'Patient')}\n"
+                f"📋 Patient: {patient_type} patient\n"
+                f"🦷 Service: {latest.get('service', 'Dental Consultation')}\n"
+                f"📅 Date: {latest.get('appointment_date')}\n"
+                f"⏰ Time: {latest.get('appointment_time')}\n\n"
+                "Would you like to confirm?"
+            )
+            return send_button_message(phone, summary, [
+                {"id": "confirm_booking", "title": "Confirm"},
+                {"id": "cancel_booking", "title": "Cancel"}
+            ])
         return send_date_options(phone)
 
     # --------------------------------------------------------
@@ -1539,9 +1572,18 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
 
         update_conversation(phone, state="BOOKING_CONFIRMATION", appointment_time=selected_time)
 
-        service_val = conversation.get("service", "Dental Consultation")
-        name_val = conversation.get("patient_name", "Patient")
-        ptype_val = conversation.get("patient_type", "New")
+        # Service-first flows reach the time step before patient details.
+        latest = get_conversation(phone, client_id=client_id)
+        if not latest.get("patient_name"):
+            update_conversation(phone, state="BOOKING_NAME", appointment_time=selected_time)
+            return send_text_message(phone, "What is the patient's *full name*?")
+        if not latest.get("patient_type"):
+            update_conversation(phone, state="BOOKING_PATIENT_TYPE", appointment_time=selected_time)
+            return send_patient_type_options(phone)
+
+        service_val = latest.get("service", "Dental Consultation")
+        name_val = latest.get("patient_name", "Patient")
+        ptype_val = latest.get("patient_type", "New")
 
         summary = (
             "Please confirm your appointment:\n\n"
@@ -1648,7 +1690,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         elif action_id in {"cancel_booking", "btn_cancel"} or normalized in {"cancel", "no"}:
             reset_conversation(phone)
             send_text_message(phone, "Your appointment booking has been cancelled.")
-            return main_menu(phone)
+            return
 
         else:
             send_text_message(phone, "Please choose Confirm or Cancel:")
@@ -1661,9 +1703,8 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
     # --------------------------------------------------------
     # 12. FALLBACK
     # --------------------------------------------------------
-    reset_conversation(phone)
-    send_text_message(phone, f"Welcome to {clinic_name()}. Send 'hi' to see the main menu.")
-    return main_menu(phone)
+    logger.info("UNHANDLED MESSAGE | client=%s | state=%s | action=%s | text=%s", client_id, current_state, action_id, text)
+    return
 
 
 # ============================================================
@@ -2012,17 +2053,3 @@ async def test_crm_connection_endpoint(client_id: str = "glaze-dental", test_dat
             status_code=502
         )
 
-
-@app.get("/api/appointments")
-@app.get("/api/v1/appointments")
-async def get_appointments_api(client_id: str = "glaze-dental", date: Optional[str] = None):
-    filters = {}
-    if date:
-        filters["date"] = date
-    res = get_appointments(client_id, filters)
-    if res.get("status") == "success":
-        return res.get("data", [])
-    return JSONResponse(
-        {"status": "error", "message": res.get("message", "Failed to retrieve appointments from CRM")},
-        status_code=res.get("status_code", 502)
-    )

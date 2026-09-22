@@ -749,7 +749,8 @@ class MetaCloudProvider:
             logger.error("WHATSAPP SEND ERROR | %s: %s", type(exc).__name__, exc)
             return False
 
-    @classmethod    def send_text(cls, phone: str, text: str, client_id: Optional[str] = None) -> bool:
+    @classmethod
+    def send_text(cls, phone: str, text: str, client_id: Optional[str] = None) -> bool:
         payload = {
             "messaging_product": "whatsapp",
             "to": phone,

@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import sys
 import sqlite3
 import datetime
 import asyncio
@@ -46,7 +47,9 @@ TIMEZONE_KOLKATA = ZoneInfo("Asia/Kolkata")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    stream=sys.stdout,
+    force=True
 )
 logger = logging.getLogger("nextlite")
 
@@ -552,7 +555,12 @@ class CRMClient:
                 return None
 
             data = response.json()
-            return data.get("availableSlots", [])
+            slots = data.get("availableSlots", [])
+            logger.info(
+                "CRM SLOTS RESULT | client=%s | date=%s | count=%d | slots=%s",
+                client_id, date_str, len(slots), slots
+            )
+            return slots
         except requests.exceptions.SSLError as exc:
             logger.error("CRM SLOTS TLS ERROR | url=%s | detail=%s", url, repr(exc))
             return None
@@ -597,8 +605,8 @@ class CRMClient:
             logger.info("CRM BOOKING REQUEST | client=%s | date=%s | time=%s", client_id, booking_date, booking_time)
             response = requests.post(url, headers=headers, json=payload, timeout=20)
             logger.info(
-                "CRM BOOKING | client=%s | date=%s | time=%s | status=%d",
-                client_id, booking_date, booking_time, response.status_code
+                "CRM BOOKING RESPONSE | client=%s | date=%s | time=%s | status=%d | body=%s",
+                client_id, booking_date, booking_time, response.status_code, response.text[:500]
             )
 
             if response.status_code == 201:
@@ -1264,6 +1272,10 @@ def is_pricing_question(text: str) -> bool:
 # ============================================================
 
 def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optional[str] = None, client_id: Optional[str] = None):
+    logger.info(
+        "HANDLER START | client=%s | user=%s | type=%s | action=%s | text=%s",
+        client_id, phone, msg_type, action_id, text[:200]
+    )
     conversation = get_conversation(phone, client_id=client_id)
     client_id = client_id or conversation.get("client_id", "glaze-dental")
     current_state = conversation.get("state", "IDLE")
@@ -1595,6 +1607,10 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             data = res.get("data", {})
 
             if status == "success":
+                logger.info(
+                    "BOOKING SUCCESS | client=%s | user=%s | date=%s | time=%s",
+                    client_id, phone, c_date, c_time
+                )
                 # 201 Created
                 crm_apt_id = data.get("appointmentId") or data.get("id") or data.get("appointment", {}).get("id")
                 local_apt_id = save_appointment_record(
@@ -1633,6 +1649,10 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                 return
 
             elif status == "conflict":
+                logger.warning(
+                    "BOOKING CONFLICT | client=%s | user=%s | date=%s | time=%s",
+                    client_id, phone, c_date, c_time
+                )
                 # 409 Conflict: Slot booked by someone else
                 send_text_message(
                     phone,
@@ -1790,6 +1810,14 @@ async def whatsapp_webhook(request: Request):
                     send_text_message(sender, "Thank you for reaching out! I can assist with text messages for booking appointments, services, and clinic details.", client_id=resolved_client_id)
                     processed += 1
                     continue
+
+                conversation = get_conversation(sender, client_id=resolved_client_id)
+                logger.info(
+                    "INCOMING MESSAGE | client=%s | user=%s | type=%s | state=%s | action=%s | text=%s",
+                    resolved_client_id, sender, msg_type, conversation.get("state", "IDLE"),
+                    action_id, text_content[:200]
+                )
+                log_chat(sender, "incoming", text_content or f"[{msg_type}]", msg_type, client_id=resolved_client_id)
 
                 if not text_content and not action_id:
                     continue

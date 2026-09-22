@@ -1252,7 +1252,8 @@ def is_emergency(text: str) -> bool:
     return any(w in text_lower for w in emergency_keywords)
 
 
-def is_pricing_question(text: str) -> bool:    text_lower = text.lower()
+def is_pricing_question(text: str) -> bool:
+    text_lower = text.lower()
     pricing_keywords = ["price", "cost", "fee", "fees", "charge", "charges", "how much", "rate", "rates", "pricing"]
     return any(w in text_lower for w in pricing_keywords)
 

@@ -229,6 +229,7 @@ def init_db():
             state TEXT NOT NULL DEFAULT 'IDLE',
             service TEXT,
             patient_name TEXT,
+            patient_age TEXT,
             patient_type TEXT,
             appointment_date TEXT,
             appointment_time TEXT,
@@ -244,11 +245,11 @@ def init_db():
         ("state", "TEXT NOT NULL DEFAULT 'IDLE'"),
         ("service", "TEXT"),
         ("patient_name", "TEXT"),
+        ("patient_age", "TEXT"),
         ("patient_type", "TEXT"),
         ("appointment_date", "TEXT"),
         ("appointment_time", "TEXT"),
-    ]:
-        if _col not in _existing_conv_cols:
+    ]:        if _col not in _existing_conv_cols:
             cursor.execute(f"ALTER TABLE conversations ADD COLUMN {_col} {_def}")
 
     # Existing deployments used phone as the sole primary key. Rebuild that
@@ -262,6 +263,7 @@ def init_db():
                 state TEXT NOT NULL DEFAULT 'IDLE',
                 service TEXT,
                 patient_name TEXT,
+                patient_age TEXT,
                 patient_type TEXT,
                 appointment_date TEXT,
                 appointment_time TEXT,
@@ -271,8 +273,8 @@ def init_db():
         """)
         cursor.execute("""
             INSERT OR IGNORE INTO conversations_v2
-            (phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, updated_at)
-            SELECT phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, updated_at
+            (phone, client_id, state, service, patient_name, patient_age, patient_type, appointment_date, appointment_time, updated_at)
+            SELECT phone, client_id, state, service, patient_name, patient_age, patient_type, appointment_date, appointment_time, updated_at
             FROM conversations
         """)
         cursor.execute("DROP TABLE conversations")
@@ -496,7 +498,6 @@ def is_message_processed(msg_id: str) -> bool:
     row = conn.execute("SELECT msg_id FROM processed_messages WHERE msg_id = ?", (msg_id,)).fetchone()
     conn.close()
     return row is not None
-
 
 def mark_message_processed(msg_id: str):
     if not msg_id:
@@ -747,8 +748,7 @@ class MetaCloudProvider:
             logger.error("WHATSAPP SEND ERROR | %s: %s", type(exc).__name__, exc)
             return False
 
-    @classmethod
-    def send_text(cls, phone: str, text: str, client_id: Optional[str] = None) -> bool:
+    @classmethod    def send_text(cls, phone: str, text: str, client_id: Optional[str] = None) -> bool:
         payload = {
             "messaging_product": "whatsapp",
             "to": phone,
@@ -924,6 +924,7 @@ def get_conversation(phone: str, client_id: Optional[str] = None) -> Dict[str, A
             "state": "IDLE",
             "service": None,
             "patient_name": None,
+            "patient_age": None,
             "patient_type": None,
             "appointment_date": None,
             "appointment_time": None
@@ -937,6 +938,7 @@ def update_conversation(
     state: Optional[str] = None,
     service: Optional[str] = None,
     patient_name: Optional[str] = None,
+    patient_age: Optional[str] = None,
     patient_type: Optional[str] = None,
     appointment_date: Optional[str] = None,
     appointment_time: Optional[str] = None
@@ -946,6 +948,7 @@ def update_conversation(
     state = state if state is not None else current["state"]
     service = service if service is not None else current["service"]
     patient_name = patient_name if patient_name is not None else current["patient_name"]
+    patient_age = patient_age if patient_age is not None else current.get("patient_age")
     patient_type = patient_type if patient_type is not None else current["patient_type"]
     appointment_date = appointment_date if appointment_date is not None else current["appointment_date"]
     appointment_time = appointment_time if appointment_time is not None else current["appointment_time"]
@@ -953,18 +956,19 @@ def update_conversation(
     conn = get_db()
     conn.execute("""
         INSERT INTO conversations
-        (phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (phone, client_id, state, service, patient_name, patient_age, patient_type, appointment_date, appointment_time, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(client_id, phone) DO UPDATE SET
             client_id = excluded.client_id,
             state = excluded.state,
             service = excluded.service,
             patient_name = excluded.patient_name,
+            patient_age = excluded.patient_age,
             patient_type = excluded.patient_type,
             appointment_date = excluded.appointment_date,
             appointment_time = excluded.appointment_time,
             updated_at = excluded.updated_at
-    """, (phone, client_id, state, service, patient_name, patient_type, appointment_date, appointment_time, now_iso()))
+    """, (phone, client_id, state, service, patient_name, patient_age, patient_type, appointment_date, appointment_time, now_iso()))
     conn.commit()
     conn.close()
 
@@ -976,6 +980,7 @@ def reset_conversation(phone: str, client_id: Optional[str] = None):
         state="IDLE",
         service=None,
         patient_name=None,
+        patient_age=None,
         patient_type=None,
         appointment_date=None,
         appointment_time=None
@@ -997,8 +1002,7 @@ def save_appointment_record(
     cursor.execute("""
         INSERT INTO appointments
         (phone, client_id, crm_appointment_id, service, patient_name, patient_type, appointment_date, appointment_time, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
-    """, (phone, client_id, crm_appointment_id, service, patient_name, patient_type, appointment_date, appointment_time, now_iso()))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)    """, (phone, client_id, crm_appointment_id, service, patient_name, patient_type, appointment_date, appointment_time, now_iso()))
     appt_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -1247,8 +1251,7 @@ def is_emergency(text: str) -> bool:
     return any(w in text_lower for w in emergency_keywords)
 
 
-def is_pricing_question(text: str) -> bool:
-    text_lower = text.lower()
+def is_pricing_question(text: str) -> bool:    text_lower = text.lower()
     pricing_keywords = ["price", "cost", "fee", "fees", "charge", "charges", "how much", "rate", "rates", "pricing"]
     return any(w in text_lower for w in pricing_keywords)
 
@@ -1389,11 +1392,29 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             send_text_message(phone, "Please enter a valid patient name (e.g. Rahul Sharma):")
             return
 
-        update_conversation(phone, state="BOOKING_PATIENT_TYPE", patient_name=patient_name)
+        update_conversation(phone, state="BOOKING_AGE", patient_name=patient_name)
+        send_text_message(phone, "Thanks! Please provide the patient's *age*:")
+        return
+
+    # --------------------------------------------------------
+    # 8. BOOKING_AGE
+    # --------------------------------------------------------
+    if current_state == "BOOKING_AGE":
+        age_text = text.strip()
+        if not age_text.isdigit():
+            send_text_message(phone, "Please enter the patient's age as a number (for example: 24):")
+            return
+
+        age_value = int(age_text)
+        if age_value < 1 or age_value > 120:
+            send_text_message(phone, "Please enter a valid age between 1 and 120:")
+            return
+
+        update_conversation(phone, state="BOOKING_PATIENT_TYPE", patient_age=str(age_value))
         return send_patient_type_options(phone)
 
     # --------------------------------------------------------
-    # 8. BOOKING_PATIENT_TYPE
+    # 9. BOOKING_PATIENT_TYPE
     # --------------------------------------------------------
     if current_state == "BOOKING_PATIENT_TYPE":
         patient_type = None
@@ -1413,6 +1434,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             summary = (
                 "Please confirm your appointment:\n\n"
                 f"👤 Name: {latest.get('patient_name', 'Patient')}\n"
+                f"🎂 Age: {latest.get('patient_age', 'Not provided')}\n"
                 f"📋 Patient: {patient_type} patient\n"
                 f"🦷 Service: {latest.get('service', 'Dental Consultation')}\n"
                 f"📅 Date: {latest.get('appointment_date')}\n"
@@ -1427,7 +1449,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         return send_date_options(phone)
 
     # --------------------------------------------------------
-    # 9. BOOKING_DATE
+    # 10. BOOKING_DATE
     # --------------------------------------------------------
     if current_state == "BOOKING_DATE":
         appointment_date = None
@@ -1485,7 +1507,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         return send_list_message(phone, f"Available slots for *{appointment_date}*:", "Choose time", rows)
 
     # --------------------------------------------------------
-    # 10. BOOKING_TIME
+    # 11. BOOKING_TIME
     # --------------------------------------------------------
     if current_state == "BOOKING_TIME":
         appointment_date = conversation.get("appointment_date")
@@ -1497,8 +1519,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             available_slots = get_available_slots(client_id, appointment_date) if appointment_date else None
             if available_slots is None:
                 send_text_message(
-                    phone,
-                    "Sorry, I'm unable to check live appointment availability right now. "
+                    phone,                    "Sorry, I'm unable to check live appointment availability right now. "
                     "Please try again shortly or call Glaze Dental Clinic at 9822977740."
                 )
                 return
@@ -1519,6 +1540,9 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         if not latest.get("patient_name"):
             update_conversation(phone, state="BOOKING_NAME", appointment_time=selected_time)
             return send_text_message(phone, "What is the patient's *full name*?")
+        if not latest.get("patient_age"):
+            update_conversation(phone, state="BOOKING_AGE", appointment_time=selected_time)
+            return send_text_message(phone, "Thanks! Please provide the patient's *age*:")
         if not latest.get("patient_type"):
             update_conversation(phone, state="BOOKING_PATIENT_TYPE", appointment_time=selected_time)
             return send_patient_type_options(phone)
@@ -1530,6 +1554,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         summary = (
             "Please confirm your appointment:\n\n"
             f"👤 Name: {name_val}\n"
+            f"🎂 Age: {latest.get('patient_age', 'Not provided')}\n"
             f"📋 Patient: {ptype_val} patient\n"
             f"🦷 Service: {service_val}\n"
             f"📅 Date: {appointment_date}\n"
@@ -1543,7 +1568,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
         return send_button_message(phone, summary, buttons)
 
     # --------------------------------------------------------
-    # 11. BOOKING_CONFIRMATION
+    # 12. BOOKING_CONFIRMATION
     # --------------------------------------------------------
     if current_state == "BOOKING_CONFIRMATION":
         if action_id == "confirm_booking" or normalized in {"confirm", "yes", "ok"}:
@@ -1559,7 +1584,8 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
                 customer_name=c_name,
                 customer_phone=phone,
                 booking_date=c_date,
-                booking_time=c_time
+                booking_time=c_time,
+                age=conversation.get("patient_age", "")
             )
 
             status = res.get("status")
@@ -1643,7 +1669,7 @@ def handle_user_message(phone: str, msg_type: str, text: str, action_id: Optiona
             return send_button_message(phone, "Would you like to confirm your appointment?", buttons)
 
     # --------------------------------------------------------
-    # 12. FALLBACK
+    # 13. FALLBACK
     # --------------------------------------------------------
     logger.info("UNHANDLED MESSAGE | client=%s | state=%s | action=%s | text=%s", client_id, current_state, action_id, text)
     return
@@ -1747,8 +1773,7 @@ async def whatsapp_webhook(request: Request):
                 elif msg_type == "interactive":
                     interactive = message.get("interactive", {})
                     itype = interactive.get("type")
-                    if itype == "button_reply":
-                        btn = interactive.get("button_reply", {})
+                    if itype == "button_reply":                        btn = interactive.get("button_reply", {})
                         action_id = btn.get("id")
                         text_content = btn.get("title", "").strip()
                     elif itype == "list_reply":
@@ -1997,8 +2022,7 @@ async def test_crm_connection_endpoint(
         }
 
     return JSONResponse(
-        {
-            "status": "error",
+        {            "status": "error",
             "client_id": client_id,
             "date": date_str,
             "message": "CRM slots endpoint could not be verified",
